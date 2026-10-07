@@ -73,12 +73,27 @@ pub fn build_cache_key(
     // and decode succeeds, otherwise the raw request body.
     let (mut body, effective_codec) = resolved_body(provider, request);
     let chat_token_cap_spelling = openai_chat_token_cap_spelling(provider, request);
+    let responses_surface = detect_request_surface_with_hint(&request.content, Some(provider))
+        == Some(ProviderSurface::OpenAIResponses);
 
     if let Some(object) = body.as_object_mut() {
         // `AnnotatedLlmRequest.extra` is `#[serde(flatten)]`, so provider fields
         // also land at top level — one skip pass covers both.
         for key in DEFAULT_SKIP_KEYS {
             object.remove(*key);
+        }
+        if responses_surface {
+            // Codex supplies fresh session/turn identities in these Responses
+            // fields. They control telemetry and prompt-cache affinity, not
+            // model input. Keep similarly named fields on other providers.
+            object.remove("client_metadata");
+            object.remove("prompt_cache_key");
+            if effective_codec == Some("openai_responses")
+                && let Some(api_specific) =
+                    object.get_mut("api_specific").and_then(Json::as_object_mut)
+            {
+                api_specific.remove("prompt_cache_key");
+            }
         }
         normalize_tool_call_ids(object);
     }

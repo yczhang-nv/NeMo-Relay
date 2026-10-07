@@ -82,6 +82,85 @@ fn built_in_noise_fields_do_not_change_the_key() {
 }
 
 #[test]
+fn responses_session_metadata_does_not_change_normalized_or_raw_keys() {
+    let config = cache_all_config();
+    for raw_fallback in [false, true] {
+        let mut base = request(json!({
+            "model": "m", "input": [{"role": "user", "content": "hi"}], "store": false,
+            "reasoning": {"effort": "low"}
+        }));
+        if raw_fallback {
+            // Native Codex namespace tools cannot round-trip through the
+            // normalized tool schema, so their requests remain raw-keyed.
+            base.content["tools"] = json!([{
+                "type": "namespace", "name": "functions", "tools": [{
+                    "type": "function", "name": "lookup",
+                    "parameters": {"type": "object"}
+                }]
+            }]);
+        }
+        assert_eq!(
+            resolved_body("openai.responses", &base).1,
+            (!raw_fallback).then_some("openai_responses")
+        );
+        let key = key_of("openai.responses", &base, &config);
+        for session in ["first-session", "new-session"] {
+            let mut noisy = base.clone();
+            noisy.content["prompt_cache_key"] = json!(session);
+            noisy.content["client_metadata"] = json!({
+                "session_id": session, "turn_id": format!("{session}-turn"),
+                "x-codex-turn-metadata": format!("{{\"session_id\":\"{session}\"}}")
+            });
+            assert_eq!(key, key_of("openai.responses", &noisy, &config));
+            for (field, value) in [
+                (
+                    "input",
+                    json!([{"role": "user", "content": "different prompt"}]),
+                ),
+                ("model", json!("different model")),
+                ("reasoning", json!({"effort": "high"})),
+                ("tools", json!([])),
+            ] {
+                let mut changed = noisy.clone();
+                changed.content[field] = value;
+                // An absent tool list and an empty one may normalize alike.
+                if field == "tools" && !raw_fallback {
+                    changed.content[field] = json!([{
+                        "type": "function", "name": "lookup",
+                        "parameters": {"type": "object"}
+                    }]);
+                }
+                assert_ne!(
+                    key,
+                    key_of("openai.responses", &changed, &config),
+                    "{field}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn responses_noise_field_names_remain_keyed_on_other_providers() {
+    let config = cache_all_config();
+    for provider in ["openai", "custom-provider"] {
+        let base = request(if provider == "openai" {
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        } else {
+            json!({"model": "m", "prompt": "hi"})
+        });
+        for field in ["client_metadata", "prompt_cache_key"] {
+            let mut changed = base.clone();
+            changed.content[field] = json!("provider-specific-control");
+            assert_ne!(
+                key_of(provider, &base, &config),
+                key_of(provider, &changed, &config)
+            );
+        }
+    }
+}
+
+#[test]
 fn service_tier_partitions_normalized_and_raw_keys() {
     let config = cache_all_config();
     let chat = |tier: &str| {

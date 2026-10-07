@@ -366,7 +366,9 @@ normalization:
   hit.
 - Field order and whitespace never matter (RFC 8785 canonicalization).
 - Only the built-in noise fields `stream`, `user`, `metadata`, and `store` are
-  dropped. All other normalized or raw provider controls remain in the key,
+  dropped across providers. OpenAI Responses also drops `client_metadata` and
+  `prompt_cache_key`, so fresh Codex session and turn IDs do not prevent reuse.
+  All other normalized or raw provider controls remain in the key,
   including `service_tier`; there is no configurable skip list.
 - OpenAI Chat requests preserve whether the caller used `max_tokens` or
   `max_completion_tokens`, because providers can treat the two fields
