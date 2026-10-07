@@ -373,3 +373,70 @@ static TOOL_OVERRIDE_MAP_VALUE: nemo_relay::config_editor::EditorListItemSpec =
         tagged_union: None,
         list_item: None,
     };
+
+/// Persistent response recording policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayMode {
+    /// Always execute live and capture eligible results.
+    #[default]
+    Record,
+    /// Serve matches and capture new live branches.
+    ReplayOrRecord,
+    /// Reject every managed LLM or recorded-tool fallback.
+    ReplayOnly,
+}
+
+/// Work performed by tools during replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayToolMode {
+    /// Execute real callbacks.
+    #[default]
+    Live,
+    /// Record or replay explicitly cacheable read-only tools.
+    Recorded,
+}
+
+/// Tool workload selection, independent of LLM delivery.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplayToolsConfig {
+    /// Tool execution mode.
+    pub mode: ReplayToolMode,
+}
+
+/// Disk fixture settings. Omit this section to retain ordinary cache behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplayConfig {
+    /// Live execution and lookup policy.
+    pub mode: ReplayMode,
+    /// Immutable source fixture; required for replay modes.
+    pub input_path: Option<String>,
+    /// Atomic destination; required for recording modes.
+    pub output_path: Option<String>,
+    /// Tool workload; defaults to live callbacks.
+    pub tools: ReplayToolsConfig,
+    /// Capture request bodies and tool arguments for diagnosis (never headers).
+    pub capture_requests: bool,
+    /// Optional producer harness revision.
+    pub harness_revision: Option<String>,
+}
+
+nemo_relay::editor_config! {
+    impl ReplayToolsConfig {
+        mode => { label: "mode", kind: Enum, values: ["live", "recorded"] },
+    }
+}
+
+nemo_relay::editor_config! {
+    impl ReplayConfig {
+        mode => { label: "mode", kind: Enum, values: ["record", "replay_or_record", "replay_only"] },
+        input_path => { label: "input_path", kind: String, optional: true },
+        output_path => { label: "output_path", kind: String, optional: true },
+        capture_requests => { label: "capture_requests", kind: Boolean },
+        harness_revision => { label: "harness_revision", kind: String, optional: true },
+        tools => { label: "tools", kind: Section, nested: ReplayToolsConfig, default: ReplayToolsConfig },
+    }
+}

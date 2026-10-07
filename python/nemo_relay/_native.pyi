@@ -2844,3 +2844,11 @@ def __getattr__(name: str) -> object:
         Raises ``AttributeError`` when no native attribute exists.
     """
     ...
+
+async def finalize_replay() -> list[_JsonObject]:
+    """Drain and atomically save every active replay fixture."""
+    ...
+
+def replay_reports() -> list[_JsonObject]:
+    """Snapshot every active replay session."""
+    ...

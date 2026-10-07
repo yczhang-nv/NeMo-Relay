@@ -16,6 +16,8 @@ from typing import Literal, Protocol, TypedDict, cast
 from nemo_relay import Json, JsonObject, UnsupportedBehavior
 from nemo_relay._native import AdaptiveRuntime as AdaptiveRuntime
 from nemo_relay._native import build_cache_telemetry_event as _build_cache_telemetry_event
+from nemo_relay._native import finalize_replay as _finalize_replay
+from nemo_relay._native import replay_reports as _replay_reports
 from nemo_relay._native import set_latency_sensitivity as _set_latency_sensitivity
 from nemo_relay._native import validate_adaptive_config as _validate_adaptive_config
 
@@ -377,6 +379,63 @@ class ToolCacheConfig:
 
 
 @dataclass(slots=True)
+class ReplayToolsConfig:
+    """Tool workload: real callbacks or explicitly classified recorded results."""
+
+    mode: Literal["live", "recorded"] = "live"
+
+    def to_dict(self) -> JsonObject:
+        """Serialize tool workload selection to canonical plugin keys."""
+        return {"mode": self.mode}
+
+
+@dataclass(slots=True)
+class ReplayConfig:
+    """Disk recording/replay settings. Request capture excludes transport headers."""
+
+    mode: Literal["record", "replay_or_record", "replay_only"] = "record"
+    input_path: str | None = None
+    output_path: str | None = None
+    tools: ReplayToolsConfig = field(default_factory=ReplayToolsConfig)
+    capture_requests: bool = False
+    harness_revision: str | None = None
+
+    def to_dict(self) -> JsonObject:
+        """Serialize fixture settings to canonical plugin keys."""
+        return _normalize_object(
+            {
+                "mode": self.mode,
+                "input_path": self.input_path,
+                "output_path": self.output_path,
+                "tools": self.tools.to_dict(),
+                "capture_requests": self.capture_requests,
+                "harness_revision": self.harness_revision,
+            }
+        )
+
+
+async def finalize_replay() -> list[JsonObject]:
+    """Stop calls, drain recordings, and atomically save active replay fixtures.
+
+    Consume or close all streams before awaiting. Finalize before closing the
+    plugin activation. Persistence failures raise and can be retried.
+
+    Returns:
+        Reports for all active replay sessions after successful finalization.
+    """
+    return cast(list[JsonObject], await _finalize_replay())
+
+
+def replay_reports() -> list[JsonObject]:
+    """Snapshot all active replay sessions without request bodies or credentials.
+
+    Returns:
+        Activity and coverage reports for currently registered replay sessions.
+    """
+    return cast(list[JsonObject], _replay_reports())
+
+
+@dataclass(slots=True)
 class ResponseCacheConfig:
     """Opt-in LLM response and tool-result cache settings.
 
@@ -398,6 +457,7 @@ class ResponseCacheConfig:
         header_allowlist: Request headers folded into the key; never auth headers.
         backend: Cache storage backend (``in_memory`` or ``redis``).
         tools: Opt-in tool-result cache; ``None`` leaves it off.
+        replay: Persistent fixture policy; ``None`` retains ordinary cache behavior.
     """
 
     ttl_seconds: int = 3600
@@ -409,6 +469,7 @@ class ResponseCacheConfig:
     header_allowlist: list[str] = field(default_factory=list)
     backend: BackendSpec = field(default_factory=BackendSpec.in_memory)
     tools: ToolCacheConfig | None = None
+    replay: ReplayConfig | None = None
 
     def to_dict(self) -> JsonObject:
         """Serialize this response-cache config to the canonical JSON object shape."""
@@ -427,6 +488,7 @@ class ResponseCacheConfig:
                 "header_allowlist": self.header_allowlist,
                 "backend": _normalize(self.backend),
                 "tools": _normalize(self.tools),
+                "replay": _normalize(self.replay),
             }
         )
 
@@ -568,6 +630,10 @@ __all__ = [
     "ConfigPolicy",
     "ConfigReport",
     "ComponentSpec",
+    "ReplayConfig",
+    "ReplayToolsConfig",
+    "finalize_replay",
+    "replay_reports",
     "ResponseCacheConfig",
     "ResponseCacheKeyStrategy",
     "StateConfig",

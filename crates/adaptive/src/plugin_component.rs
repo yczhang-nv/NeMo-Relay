@@ -339,6 +339,7 @@ fn validate_response_cache_section(
             "header_allowlist",
             "backend",
             "tools",
+            "replay",
         ],
     );
     if let Some(backend_json) = response_cache_json.get("backend").and_then(Json::as_object) {

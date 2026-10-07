@@ -555,7 +555,8 @@ cache key derivation. To derive keys before ACG rewrites requests, set
 Cached LLM responses and tool results are stored unredacted. PII sanitize
 guardrails rewrite emitted telemetry, never payloads, so the store holds full
 result bodies. Cache entries can also store provider and model diagnostics plus
-the key fingerprint; they do not store full LLM request bodies or headers. A
+the key fingerprint; ordinary cache entries do not store full LLM request bodies or headers.
+Replay fixtures can capture request bodies as described below. A
 shared Redis backend must be trusted and access-controlled. Use a separate
 configuration and namespace for each mutually untrusted tenant or upstream
 domain. `backend.config.max_bytes` limits only the in-memory backend; configure
@@ -595,3 +596,149 @@ Tool-cache diagnostics use the following error codes.
 | `response_cache.tool_catch_all_override` | A cacheable `*` override applies to every tool. |
 | `response_cache.tool_conflicting_classes` | Overlapping wildcard members in different classes have different `cacheable` values. |
 | `response_cache.tool_conflicting_overrides` | Overlapping wildcard overrides have different `cacheable` declarations. An omitted value inherits policy, so it cannot safely overlap an explicit value. |
+
+## Persistent Replay
+
+Add a `replay` section to record managed calls in a versioned JSON fixture and
+load it before a later run. Replay reuses normalized `exact_request` keys;
+matching requests receive one saved answer regardless of call order.
+
+| Mode | Matching request | Missing or ineligible request | Fixture behavior |
+|---|---|---|---|
+| `record` | Run live | Run live | Capture eligible complete results. |
+| `replay_or_record` | Serve saved result | Run live | Save a derived fixture to a different path. |
+| `replay_only` | Serve saved result | Return a replay error | Read-only, with no live fallback. |
+
+Replay requires the `in_memory` backend and uses `backend.config.max_bytes`
+(default 256 MiB) to bound fixture loading and recording. It rejects incompatible
+key/tool policies, unsupported schema versions, corrupt checksums, conflicting
+responses and oversized artifacts before registration succeeds. Initialization
+errors propagate to the caller. Frozen entries do not expire or evict, and
+replay ignores ordinary TTL and bypass sampling.
+
+| Replay field | Meaning |
+|---|---|
+| `mode` | Defaults to `record`. |
+| `input_path` | Required in replay modes; absent for `record`. |
+| `output_path` | Required in recording modes; absent for `replay_only`. Must not alias the source fixture. |
+| `tools.mode` | `live` (default) executes actual callbacks, including when matching tool entries exist. `recorded` records or replays explicitly cacheable tools. |
+| `capture_requests` | Defaults to `false`. Capture LLM bodies and tool arguments for diagnosis; transport headers are never captured. |
+| `harness_revision` | Optional producer revision stored as provenance. |
+
+Recorded-tool mode requires `tools.enabled = true` and the existing explicit
+read-only tool policies. In strict recorded-tool mode, any unclassified,
+ineligible or missing tool call returns an error before invoking its callback.
+Retain stable data, versions, inputs and clocks when comparing benchmark runs.
+Live tools can introduce new LLM requests when their results change.
+
+<Tabs>
+<Tab title="Python" language="python">
+```python
+import nemo_relay
+from nemo_relay import adaptive, plugin
+
+async def record() -> None:
+    config = plugin.PluginConfig(components=[adaptive.ComponentSpec(
+        adaptive.AdaptiveConfig(response_cache=adaptive.ResponseCacheConfig(
+            namespace="replay-harness",
+            cache_nondeterministic=True,
+            replay=adaptive.ReplayConfig(
+                mode="record", output_path="recording.json",
+            ),
+        )),
+    )])
+    async with plugin.activate(config):
+        # Run the harness using managed llm.execute / llm.stream_execute calls.
+        reports = await adaptive.finalize_replay()
+        assert reports[0]["finalized"]
+```
+Use `ReplayConfig(mode="replay_only", input_path="recording.json")` for strict
+replay. For development, use `mode="replay_or_record"`, the source `input_path`,
+and a different `output_path`.
+</Tab>
+<Tab title="Node.js" language="javascript">
+```javascript
+const adaptive = require('nemo-relay-node/adaptive');
+const plugin = require('nemo-relay-node/plugin');
+
+const activation = await plugin.initialize({
+  version: 1,
+  components: [adaptive.ComponentSpec({
+    version: 1,
+    responseCache: adaptive.responseCacheConfig({
+      namespace: 'replay-harness',
+      cacheNondeterministic: true,
+      replay: { mode: 'record', outputPath: 'recording.json' },
+    }),
+  })],
+});
+try {
+  // Run the harness using managed calls; finish or close each stream.
+  const reports = await adaptive.finalizeReplay();
+  console.log(reports);
+} finally {
+  await activation.close();
+}
+```
+Node.js helper fields use `inputPath`, `outputPath`, `captureRequests` and
+`harnessRevision`. Canonical plugin documents use `snake_case`.
+</Tab>
+<Tab title="Rust" language="rust">
+```rust
+use nemo_relay_adaptive::{ReplayConfig, ReplayMode, ResponseCacheConfig};
+
+let cache = ResponseCacheConfig {
+    namespace: "replay-harness".into(),
+    cache_nondeterministic: true,
+    replay: Some(ReplayConfig {
+        mode: ReplayMode::Record,
+        output_path: Some("recording.json".into()),
+        ..ReplayConfig::default()
+    }),
+    ..ResponseCacheConfig::default()
+};
+// Activate the adaptive component with this response_cache section, run the
+// harness, then finalize before closing the plugin activation:
+let reports = nemo_relay_adaptive::finalize_replay().await?;
+```
+</Tab>
+</Tabs>
+
+Finalization stops accepting new replay calls, waits for active calls and stream
+commits, and atomically replaces the destination. Consume or close streams
+before awaiting finalization, and finalize before closing the plugin activation.
+Saving failures preserve the previous destination and return an error; retry
+finalization after correcting the storage problem. Reports distinguish lost
+captures (`failed_writes`) from publication attempts (`persistence_errors`), so a
+successful save retry can publish all retained captures. `wait_for_idle()` only drains
+telemetry and does not replace recording finalization. Closing a plugin without
+finalizing does not publish a recording.
+
+`replay_reports()` (`replayReports()` in Node.js) snapshots active sessions.
+Reports separate LLM and tool hits, misses, live calls, captures and uncaptured
+calls, count buffered and streaming delivery, identify fixtures and tool modes,
+and retain failure reason, call position, identity and available key hash.
+`finalized` confirms the recording completion boundary; the harness must still
+check its own completion and errors. Strict benchmarks require completion with
+zero live managed LLM calls and the expected tool workload. Fixture loading and
+finalization belong outside the timed agent run.
+
+Buffered calls return the saved answer. Streaming calls synthesize supported
+provider-native chunks from the same aggregate; strict replay rejects an
+unfaithful reconstruction. Original chunk boundaries, timing and call order are
+not reproduced. All four combinations of live/recorded tools and
+buffered/streaming delivery are supported. Report synthesized-stream benchmarks
+separately from buffered measurements.
+
+Identical duplicates collapse to one entry. Conflicting results remain visible in
+coverage and prevent loading the fixture. Incomplete recordings can be loaded
+for development, but strict loading rejects uncaptured calls and failed writes;
+derived recordings retain source coverage gaps. Future strict misses still fail
+at runtime because a fixture cannot guarantee coverage of changed requests.
+
+<Warning>
+Fixtures contain unredacted results. Enabling `capture_requests` also includes
+private prompt bodies and tool arguments. Request capture changes diagnostics,
+not matching. Ordinary replay reports exclude those bodies and transport
+credentials. Store fixtures in a trusted location.
+</Warning>

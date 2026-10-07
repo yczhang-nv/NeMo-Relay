@@ -100,6 +100,13 @@ pub fn validate_config(config: &AdaptiveConfig) -> ConfigReport {
 /// so a misconfiguration is caught at startup instead of producing surprising
 /// runtime behavior.
 fn validate_response_cache(report: &mut ConfigReport, config: &ResponseCacheConfig) {
+    if let Err(message) = crate::response_cache::fixture::validate(config) {
+        report.diagnostics.push(response_cache_error(
+            "response_cache.invalid_replay",
+            Some("replay"),
+            message,
+        ));
+    }
     if config.namespace.trim().is_empty() {
         report.diagnostics.push(response_cache_error(
             "response_cache.missing_namespace",

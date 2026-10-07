@@ -233,6 +233,40 @@ class ToolCacheConfig:
         ...
 
 @dataclass(slots=True)
+class ReplayToolsConfig:
+    """Select live callbacks or explicitly classified recorded results."""
+
+    mode: Literal["live", "recorded"] = ...
+    def to_dict(self) -> JsonObject:
+        """Serialize the tool workload selection."""
+        ...
+
+@dataclass(slots=True)
+class ReplayConfig:
+    """Persistent fixture configuration for managed response replay."""
+
+    mode: Literal["record", "replay_or_record", "replay_only"] = ...
+    input_path: str | None = ...
+    output_path: str | None = ...
+    tools: ReplayToolsConfig = ...
+    capture_requests: bool = ...
+    harness_revision: str | None = ...
+    def to_dict(self) -> JsonObject:
+        """Serialize fixture settings to canonical plugin keys."""
+        ...
+
+async def finalize_replay() -> list[JsonObject]:
+    """Stop replay calls, drain recordings and atomically publish fixtures.
+
+    Consume or close streams before awaiting, and finalize before closing the
+    plugin activation. Storage failures raise and allow retry.
+    """
+    ...
+
+def replay_reports() -> list[JsonObject]:
+    """Snapshot active replay sessions without request bodies or credentials."""
+    ...
+@dataclass(slots=True)
 class ResponseCacheConfig:
     """Opt-in LLM response and tool-result cache settings.
 
@@ -251,6 +285,7 @@ class ResponseCacheConfig:
         header_allowlist: Request headers folded into the key.
         backend: Cache storage backend (``in_memory`` or ``redis``).
         tools: Opt-in tool-result cache; ``None`` leaves the tool surface off.
+        replay: Persistent fixture policy; ``None`` retains ordinary cache behavior.
     """
 
     ttl_seconds: int = ...
@@ -262,6 +297,7 @@ class ResponseCacheConfig:
     header_allowlist: list[str] = ...
     backend: BackendSpec = ...
     tools: ToolCacheConfig | None = ...
+    replay: ReplayConfig | None = ...
 
     def to_dict(self) -> JsonObject:
         """Serialize this response-cache config to the canonical JSON object shape."""

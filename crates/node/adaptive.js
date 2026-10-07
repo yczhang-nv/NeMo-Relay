@@ -233,6 +233,14 @@ function toToolCachePluginConfig(config) {
 function toResponseCachePluginConfig(config) {
   const serialized = mapPluginFields(config, RESPONSE_CACHE_PLUGIN_FIELDS);
   if (serialized === config) return config;
+  if (serialized.replay !== undefined) {
+    serialized.replay = mapPluginFields(serialized.replay, {
+      inputPath: 'input_path',
+      outputPath: 'output_path',
+      captureRequests: 'capture_requests',
+      harnessRevision: 'harness_revision',
+    });
+  }
   if (serialized.tools !== undefined) {
     serialized.tools = toToolCachePluginConfig(serialized.tools);
   }
@@ -303,6 +311,8 @@ module.exports = {
   AdaptiveRuntime,
   ADAPTIVE_PLUGIN_KIND,
   ResponseCacheKeyStrategy,
+  finalizeReplay: lib.finalizeReplay,
+  replayReports: lib.replayReports,
   defaultConfig,
   inMemoryBackend,
   redisBackend,

@@ -6883,3 +6883,19 @@ pub fn validate_exact(config: Json) -> napi::Result<Json> {
 pub fn list_plugin_kinds() -> Vec<String> {
     list_plugin_kinds_impl()
 }
+
+/// Stop accepting replay calls, drain recordings and atomically publish fixtures.
+#[napi(js_name = "finalizeReplay")]
+pub async fn finalize_replay() -> napi::Result<Json> {
+    let reports = nemo_relay_adaptive::finalize_replay()
+        .await
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+    serde_json::to_value(reports).map_err(|error| napi::Error::from_reason(error.to_string()))
+}
+
+/// Snapshot active replay sessions without exposing request bodies.
+#[napi(js_name = "replayReports")]
+pub fn replay_reports() -> napi::Result<Json> {
+    serde_json::to_value(nemo_relay_adaptive::replay_reports())
+        .map_err(|error| napi::Error::from_reason(error.to_string()))
+}

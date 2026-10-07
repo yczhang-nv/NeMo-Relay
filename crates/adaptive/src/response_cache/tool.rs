@@ -225,6 +225,91 @@ pub(crate) fn make_tool_intercept(
     })
 }
 
+async fn run_tool_replay(
+    name: String,
+    args: Json,
+    next: ToolExecutionNextFn,
+    store: Arc<dyn CacheStore>,
+    response_cache: Arc<ResponseCacheConfig>,
+    tools: Arc<ToolCacheConfig>,
+) -> FlowResult<ToolExecutionInterceptOutcome> {
+    let session = store.replay_session().expect("replay session");
+    let mut call = session.begin("tool", "tool", &name)?;
+    if !session.recorded_tools() {
+        call.live();
+        return next(args).await.map(Into::into);
+    }
+    let policy = resolve_policy(&name, &response_cache, &tools);
+    let key = if policy.cacheable {
+        build_tool_cache_key(
+            &response_cache.namespace,
+            &name,
+            policy.tool_version.as_deref(),
+            &args,
+            &policy.arg_skip,
+            tools.cache_errors,
+        )
+    } else {
+        KeyOutcome::Bypass(CacheReason::Uncacheable)
+    };
+    let key = match key {
+        KeyOutcome::Key(key) => key,
+        KeyOutcome::Bypass(_) => {
+            if session.strict() {
+                return Err(call.error("ineligible_request"));
+            }
+            call.failure("ineligible_request");
+            call.live();
+            return next(args).await.map(Into::into);
+        }
+    };
+    if let Some(response) = session.lookup(&mut call, &key) {
+        let result = decode_tool_result(&response);
+        if tools.cache_errors || !is_error_shaped_tool_result(&result.result) {
+            call.hit();
+            emit_cache_mark(
+                CacheMark::new(CacheMarkStatus::Hit, "replay")
+                    .surface(CacheSurface::Tool)
+                    .key_hash(&key),
+            );
+            return Ok(result.into());
+        }
+        if session.strict() {
+            return Err(call.error("ineligible_response"));
+        }
+        call.failure("ineligible_response");
+    } else if session.strict() {
+        return Err(call.error("missing_entry"));
+    }
+    call.live();
+    let captured_args = if response_cache
+        .replay
+        .as_ref()
+        .is_some_and(|replay| replay.capture_requests)
+    {
+        args.clone()
+    } else {
+        Json::Null
+    };
+    let result = next(args).await?;
+    if tools.cache_errors || !is_error_shaped_tool_result(&result.result) {
+        session.capture(
+            &mut call,
+            CacheEntry::new(
+                encode_tool_result(&result),
+                policy.ttl,
+                key,
+                policy.tool_version,
+                None,
+            ),
+            captured_args,
+        );
+    } else {
+        call.failure("ineligible_response");
+    }
+    Ok(result.into())
+}
+
 async fn run_tool_cache(
     name: String,
     args: Json,
@@ -233,6 +318,9 @@ async fn run_tool_cache(
     response_cache: Arc<ResponseCacheConfig>,
     tools: Arc<ToolCacheConfig>,
 ) -> FlowResult<ToolExecutionInterceptOutcome> {
+    if store.replay_session().is_some() {
+        return run_tool_replay(name, args, next, store, response_cache, tools).await;
+    }
     let policy = resolve_policy(&name, &response_cache, &tools);
 
     if !policy.cacheable {

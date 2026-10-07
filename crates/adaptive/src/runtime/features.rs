@@ -74,6 +74,7 @@ pub struct AdaptiveRuntime {
     runtime_id: Uuid,
     bound_scopes: Arc<RwLock<HashSet<Uuid>>>,
     registrations: Vec<ComponentRegistration>,
+    replay_store: Option<Arc<dyn crate::response_cache::store::CacheStore>>,
 }
 
 struct TelemetryDrainTask {
@@ -236,6 +237,7 @@ impl AdaptiveRuntime {
             runtime_id: Uuid::now_v7(),
             bound_scopes: Arc::new(RwLock::new(HashSet::new())),
             registrations: vec![],
+            replay_store: None,
         })
     }
 
@@ -423,6 +425,9 @@ impl AdaptiveRuntime {
         }
 
         self.registered = true;
+        if let Some(store) = &self.replay_store {
+            crate::response_cache::fixture::register_session(self.runtime_id, store);
+        }
         Ok(())
     }
 
@@ -536,6 +541,7 @@ impl AdaptiveRuntime {
     /// until the drain completes. Call [`Self::shutdown`] when completion must
     /// be observed before the runtime is dropped.
     pub fn deregister(&mut self) -> Result<()> {
+        crate::response_cache::fixture::unregister_session(self.runtime_id);
         rollback_registrations(&mut self.registrations);
         if let Ok(mut guard) = self.bound_scopes.write() {
             guard.clear();
@@ -878,19 +884,48 @@ impl AdaptiveFeature for ResponseCacheFeature {
         ctx: &'a mut RegistrationContext<'_>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let store = match build_store(&self.config).await {
-                Ok(store) => store,
-                Err(AdaptiveError::Storage(error)) => {
-                    log::warn!(
-                        target: "nemo_relay.runtime",
-                        event = "adaptive_response_cache_store_init_failed";
-                        "Adaptive runtime could not initialize the optional response cache; \
-                         managed LLM and tool calls will run live: {error}"
-                    );
-                    return Ok(());
+            let store: Arc<dyn crate::response_cache::store::CacheStore> = if self
+                .config
+                .replay
+                .is_some()
+            {
+                let config = self.config.clone();
+                let middleware = serde_json::json!({
+                    "response_cache_priority": config.priority,
+                    "acg": ctx.runtime.config.acg,
+                    "adaptive_hints": ctx.runtime.config.adaptive_hints,
+                    "tool_parallelism": ctx.runtime.config.tool_parallelism,
+                });
+                Arc::new(
+                    tokio::task::spawn_blocking(move || {
+                        let mut session =
+                            crate::response_cache::fixture::ReplaySession::load(&config)?;
+                        session.set_middleware(middleware);
+                        Ok::<_, AdaptiveError>(session)
+                    })
+                    .await
+                    .map_err(|e| {
+                        AdaptiveError::Storage(format!("replay: persistence_error: {e}"))
+                    })??,
+                )
+            } else {
+                match build_store(&self.config).await {
+                    Ok(store) => store,
+                    Err(AdaptiveError::Storage(error)) if self.config.replay.is_none() => {
+                        log::warn!(
+                            target: "nemo_relay.runtime",
+                            event = "adaptive_response_cache_store_init_failed";
+                            "Adaptive runtime could not initialize the optional response cache; \
+                             managed LLM and tool calls will run live: {error}"
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             };
+            if self.config.replay.is_some() {
+                ctx.runtime.replay_store = Some(store.clone());
+            }
             let config = Arc::new(self.config.clone());
             ctx.register_llm_execution_intercept(
                 &self.name,
@@ -902,7 +937,14 @@ impl AdaptiveFeature for ResponseCacheFeature {
                 self.priority,
                 make_stream_intercept(store.clone(), config.clone()),
             )?;
-            if let Some(tools) = self.config.tools.clone().filter(|tools| tools.enabled) {
+            let replay_enabled = self.config.replay.is_some();
+            if let Some(tools) = self
+                .config
+                .tools
+                .clone()
+                .filter(|tools| tools.enabled)
+                .or_else(|| replay_enabled.then(Default::default))
+            {
                 let priority = tools.priority;
                 ctx.register_tool_execution_intercept(
                     &self.tool_name,

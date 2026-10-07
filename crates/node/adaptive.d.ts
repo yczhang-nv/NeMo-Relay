@@ -75,6 +75,7 @@ export interface ResponseCacheConfig {
   backend?: BackendSpec;
   /** Opt-in tool-result cache; omit to leave the tool surface off. */
   tools?: ToolCacheConfig;
+  replay?: ReplayConfig;
 }
 
 interface ResponseCachePluginConfig {
@@ -88,6 +89,7 @@ interface ResponseCachePluginConfig {
   header_allowlist?: string[];
   backend?: BackendSpec;
   tools?: ToolCachePluginConfig;
+  replay?: ReplayPluginConfig;
 }
 
 /** Shared policy; omitted TTL and bypass rate inherit response-cache defaults. */
@@ -381,3 +383,25 @@ export declare function validateConfig(config: Config): ConfigReport;
 export declare function buildCacheTelemetryEvent(options: CacheTelemetryEventOptions): CacheTelemetryEvent | null;
 /** Set manual latency sensitivity on the current scope. */
 export declare function setLatencySensitivity(value: number): void;
+
+/** Persistent fixture policy, independent of cache TTL and sampled bypasses. */
+export interface ReplayConfig {
+  mode?: 'record' | 'replay_or_record' | 'replay_only';
+  inputPath?: string;
+  outputPath?: string;
+  captureRequests?: boolean;
+  harnessRevision?: string;
+  tools?: { mode?: 'live' | 'recorded' };
+}
+interface ReplayPluginConfig {
+  mode?: 'record' | 'replay_or_record' | 'replay_only';
+  input_path?: string;
+  output_path?: string;
+  capture_requests?: boolean;
+  harness_revision?: string;
+  tools?: { mode?: 'live' | 'recorded' };
+}
+/** Finalize before closing the plugin activation; consume or close streams first. */
+export declare function finalizeReplay(): Promise<Json[]>;
+/** Snapshot active replay sessions without request bodies. */
+export declare function replayReports(): Json[];

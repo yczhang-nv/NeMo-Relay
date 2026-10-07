@@ -93,6 +93,11 @@ impl CacheEntry {
 /// not block: the in-memory backend locks only for the duration of a
 /// synchronous map operation and never holds the lock across an `await`.
 pub trait CacheStore: Send + Sync + 'static {
+    /// Replay policy, when this storage belongs to a persistent fixture.
+    fn replay_session(&self) -> Option<&super::fixture::ReplaySession> {
+        None
+    }
+
     /// Looks up an entry. Returns `Ok(None)` when the key is absent or expired.
     /// Entries come back shared behind an [`Arc`] so a lookup never deep-clones
     /// the stored response (the in-memory backend holds its lock O(1)).
@@ -462,6 +467,14 @@ pub fn validate_backend_target(config: &ResponseCacheConfig) -> std::result::Res
 /// Returns the boxed [`CacheStore`] used by the intercept and the `doctor`
 /// health check. Redis support is gated behind the `redis-backend` feature.
 pub(crate) async fn build_store(config: &ResponseCacheConfig) -> Result<Arc<dyn CacheStore>> {
+    if config.replay.is_some() {
+        let config = config.clone();
+        let session =
+            tokio::task::spawn_blocking(move || super::fixture::ReplaySession::load(&config))
+                .await
+                .map_err(|e| AdaptiveError::Storage(format!("replay: persistence_error: {e}")))??;
+        return Ok(Arc::new(session));
+    }
     match config.backend.kind.as_str() {
         "in_memory" => Ok(Arc::new(InMemoryCacheStore::new(
             config.backend.max_bytes(),

@@ -7,7 +7,9 @@ use nemo_relay::plugin::ConfigPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
 
-use crate::response_cache::config::{BackendConfig, ResponseCacheKeyStrategy, ToolCacheConfig};
+use crate::response_cache::config::{
+    BackendConfig, ReplayConfig, ResponseCacheKeyStrategy, ToolCacheConfig,
+};
 
 /// Canonical config document for the adaptive plugin component.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +223,9 @@ pub struct ResponseCacheConfig {
     /// Opt-in tool-result cache configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolCacheConfig>,
+    /// Persistent recording/replay; absent by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay: Option<ReplayConfig>,
 }
 
 impl Default for ResponseCacheConfig {
@@ -235,6 +240,7 @@ impl Default for ResponseCacheConfig {
             header_allowlist: Vec::new(),
             backend: BackendConfig::default(),
             tools: None,
+            replay: None,
         }
     }
 }
@@ -490,6 +496,7 @@ nemo_relay::editor_config! {
 
 nemo_relay::editor_config! {
     impl ResponseCacheConfig {
+        replay => { label: "replay", kind: Section, optional: true, nested: ReplayConfig, default: ReplayConfig },
         ttl_seconds => { label: "ttl_seconds", kind: Integer },
         namespace => { label: "namespace", kind: String },
         priority => { label: "priority", kind: Integer },

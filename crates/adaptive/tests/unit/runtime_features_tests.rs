@@ -722,6 +722,7 @@ async fn adaptive_runtime_register_survives_hot_cache_seed_failures() {
         runtime_id: Uuid::now_v7(),
         bound_scopes: Arc::new(RwLock::new(HashSet::new())),
         registrations: vec![],
+        replay_store: None,
     };
 
     runtime.register().await.unwrap();

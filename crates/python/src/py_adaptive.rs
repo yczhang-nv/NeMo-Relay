@@ -390,8 +390,31 @@ fn set_latency_sensitivity(value: u32) -> PyResult<()> {
         .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
 }
 
+/// Drain and atomically save all active adaptive replay recordings.
+#[pyfunction]
+#[pyo3(signature = () -> "object", text_signature = "() -> object")]
+fn finalize_replay<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let reports = nemo_relay_adaptive::finalize_replay()
+            .await
+            .map_err(to_py_err)?;
+        let value = serde_json::to_value(reports).map_err(to_py_err)?;
+        Python::attach(|py| json_to_py(py, &value))
+    })
+}
+
+/// Snapshot active replay activity without draining telemetry.
+#[pyfunction]
+#[pyo3(signature = () -> "object", text_signature = "() -> object")]
+fn replay_reports(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let value = serde_json::to_value(nemo_relay_adaptive::replay_reports()).map_err(to_py_err)?;
+    json_to_py(py, &value)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAdaptiveRuntime>()?;
+    m.add_function(wrap_pyfunction!(finalize_replay, m)?)?;
+    m.add_function(wrap_pyfunction!(replay_reports, m)?)?;
     m.add_function(wrap_pyfunction!(build_cache_telemetry_event, m)?)?;
     m.add_function(wrap_pyfunction!(validate_adaptive_config, m)?)?;
     m.add_function(wrap_pyfunction!(set_latency_sensitivity, m)?)?;

@@ -56,6 +56,7 @@ struct CacheWriteContext {
     provider: String,
     model: Option<String>,
     anthropic_context: Option<AnthropicCacheContext>,
+    replay_call: Option<(super::fixture::ReplayCall, Json)>,
 }
 
 /// Receiver half of the streaming cache tee with upstream cleanup forwarding.
@@ -168,6 +169,9 @@ async fn run_cache(
     store: Arc<dyn CacheStore>,
     config: Arc<ResponseCacheConfig>,
 ) -> FlowResult<Json> {
+    if store.replay_session().is_some() {
+        return run_replay(provider, request, next, store, config).await;
+    }
     let backend = store.backend_kind();
 
     // Decision marks are emitted before `next()` (like the runtime's start
@@ -275,6 +279,9 @@ async fn run_cache_stream(
     store: Arc<dyn CacheStore>,
     config: Arc<ResponseCacheConfig>,
 ) -> FlowResult<LlmJsonStream> {
+    if store.replay_session().is_some() {
+        return run_replay_stream(provider, request, next, store, config).await;
+    }
     let backend = store.backend_kind();
 
     // Assembling streamed chunks into a stored response needs a streaming codec,
@@ -326,6 +333,7 @@ async fn run_cache_stream(
                 provider,
                 model,
                 anthropic_context,
+                replay_call: None,
             },
         ));
     }
@@ -385,6 +393,7 @@ async fn run_cache_stream(
                     provider,
                     model,
                     anthropic_context,
+                    replay_call: None,
                 },
             ))
         }
@@ -443,6 +452,9 @@ fn tee_and_aggregate(
                         || collect(chunk.clone()).is_err()
                     {
                         collector_failed = true;
+                        if let Some((call, _)) = &write.replay_call {
+                            call.failure("stream_not_replayable");
+                        }
                     }
                     if let Some(validator) = &mut anthropic_validator {
                         validator.observe(chunk);
@@ -451,6 +463,9 @@ fn tee_and_aggregate(
                 }
                 Err(_) => {
                     // Upstream error is a failed call: forward it, never cache.
+                    if let Some((call, _)) = &write.replay_call {
+                        call.failure("failed_call");
+                    }
                     let _ = tx.send(TeeMessage::Chunk(item)).await;
                     break;
                 }
@@ -465,6 +480,11 @@ fn tee_and_aggregate(
             }
         }
         let close_result = live.close().await;
+        if close_result.is_err()
+            && let Some((call, _)) = &write.replay_call
+        {
+            call.failure("failed_call");
+        }
         // Store only protocol-complete streams: every collector finalizes a
         // clean truncation as a well-formed partial.
         if reached_eof && close_result.is_ok() && !collector_failed && completion.is_terminal() {
@@ -485,7 +505,23 @@ fn tee_and_aggregate(
                 && !aggregate_replay_lossy(&aggregate)
                 && anthropic_valid
             {
+                let write_is_replay = write.replay_call.is_some();
                 let commit: CacheCommit = Box::pin(async move {
+                    if let Some((mut call, request)) = write.replay_call {
+                        let session = write.store.replay_session().expect("replay session");
+                        session.capture(
+                            &mut call,
+                            CacheEntry::new(
+                                aggregate,
+                                write.config.ttl(),
+                                write.key,
+                                write.model,
+                                Some(write.provider),
+                            ),
+                            request,
+                        );
+                        return;
+                    }
                     maybe_store(
                         &write.store,
                         &write.config,
@@ -497,10 +533,16 @@ fn tee_and_aggregate(
                     )
                     .await;
                 });
-                let _ = tokio::select! {
-                    _ = cancel_rx.changed() => false,
-                    sent = tx.send(TeeMessage::Commit(commit)) => sent.is_ok(),
-                };
+                if write_is_replay {
+                    commit.await;
+                } else {
+                    let _ = tokio::select! {
+                        _ = cancel_rx.changed() => false,
+                        sent = tx.send(TeeMessage::Commit(commit)) => sent.is_ok(),
+                    };
+                }
+            } else if let Some((call, _)) = &write.replay_call {
+                call.failure("stream_not_replayable");
             }
         } else if reached_eof && let Err(error) = &close_result {
             let _ = tx.send(TeeMessage::Chunk(Err(error.clone()))).await;
@@ -802,3 +844,230 @@ pub(crate) fn should_bypass(rate: f64) -> bool {
 #[cfg(test)]
 #[path = "../../tests/unit/response_cache/intercept_tests.rs"]
 mod tests;
+
+/// Replay policy is independent of ordinary lookup, TTL and sampled bypasses.
+async fn run_replay(
+    provider: String,
+    request: LlmRequest,
+    next: LlmExecutionNextFn,
+    store: Arc<dyn CacheStore>,
+    config: Arc<ResponseCacheConfig>,
+) -> FlowResult<Json> {
+    let session = store.replay_session().expect("replay session");
+    let mut call = session.begin("llm", "buffered", &provider)?;
+    call.model(request_model(&request));
+    let key = match build_cache_key(&provider, &request, &config) {
+        KeyOutcome::Key(key) => key,
+        KeyOutcome::Bypass(_) => {
+            if session.strict() {
+                return Err(call.error("ineligible_request"));
+            }
+            call.failure("ineligible_request");
+            call.live();
+            return next(request).await;
+        }
+    };
+    let context = cache_context(&request).expect("accepted cache context");
+    if let Some(response) = session.lookup(&mut call, &key) {
+        if !is_error_response(&response)
+            && context
+                .as_ref()
+                .is_none_or(|context| classify_aggregate(&response, context).is_some())
+        {
+            call.hit();
+            emit_cache_mark(CacheMark::new(CacheMarkStatus::Hit, "replay").key_hash(&key));
+            return Ok(response);
+        }
+        if session.strict() {
+            return Err(call.error("ineligible_request"));
+        }
+        call.failure("ineligible_request");
+    } else if session.strict() {
+        return Err(call.error("missing_entry"));
+    }
+    emit_cache_mark(CacheMark::new(CacheMarkStatus::Miss, "replay").key_hash(&key));
+    call.live();
+    let model = request_model(&request);
+    let body = if config
+        .replay
+        .as_ref()
+        .is_some_and(|replay| replay.capture_requests)
+    {
+        request.content.clone()
+    } else {
+        Json::Null
+    };
+    let response = next(request).await?;
+    if !is_error_response(&response)
+        && context
+            .as_ref()
+            .is_none_or(|context| classify_aggregate(&response, context).is_some())
+    {
+        session.capture(
+            &mut call,
+            CacheEntry::new(response.clone(), config.ttl(), key, model, Some(provider)),
+            body,
+        );
+    } else {
+        call.failure("ineligible_response");
+    }
+    Ok(response)
+}
+
+async fn run_replay_stream(
+    provider: String,
+    request: LlmRequest,
+    next: LlmStreamExecutionNextFn,
+    store: Arc<dyn CacheStore>,
+    config: Arc<ResponseCacheConfig>,
+) -> FlowResult<LlmJsonStream> {
+    let session = store.replay_session().expect("replay session");
+    let mut call = session.begin("llm", "streaming", &provider)?;
+    call.model(request_model(&request));
+    let surface = detect_request_surface_with_hint(&request.content, Some(&provider));
+    let key = build_cache_key(&provider, &request, &config);
+    let (surface, key) = match (surface, key) {
+        (Some(surface), KeyOutcome::Key(key)) => (surface, key),
+        (surface, _) => {
+            let reason = if surface.is_none() {
+                "stream_not_replayable"
+            } else {
+                "ineligible_request"
+            };
+            if session.strict() {
+                return Err(call.error(reason));
+            }
+            call.failure(reason);
+            call.live();
+            // Keep the guard with even an unsupported live stream through cleanup.
+            let live = next(request).await?;
+            call.streaming();
+            return Ok(forward_replay_stream(live, call));
+        }
+    };
+    let context = cache_context(&request).expect("accepted cache context");
+    if let Some(response) = session.lookup(&mut call, &key) {
+        let kind = context
+            .as_ref()
+            .and_then(|context| classify_aggregate(&response, context));
+        if (context.is_none() || kind.is_some()) && !replay_is_lossy(&response, kind) {
+            call.hit();
+            emit_cache_mark(CacheMark::new(CacheMarkStatus::Hit, "replay").key_hash(&key));
+            return Ok(guard_stream(replay_aggregate(response, kind), call));
+        }
+        if session.strict() {
+            return Err(call.error("stream_not_replayable"));
+        }
+        call.failure("stream_not_replayable");
+    } else if session.strict() {
+        return Err(call.error("missing_entry"));
+    }
+    emit_cache_mark(CacheMark::new(CacheMarkStatus::Miss, "replay").key_hash(&key));
+    call.live();
+    let model = request_model(&request);
+    let body = if config
+        .replay
+        .as_ref()
+        .is_some_and(|replay| replay.capture_requests)
+    {
+        request.content.clone()
+    } else {
+        Json::Null
+    };
+    let live = next(request).await?;
+    call.streaming();
+    Ok(tee_and_aggregate(
+        live,
+        streaming_codec(surface),
+        CacheWriteContext {
+            store,
+            config,
+            key,
+            provider,
+            model,
+            anthropic_context: context,
+            replay_call: Some((call, body)),
+        },
+    ))
+}
+
+/// Forward an ineligible live stream while retaining recording ownership until
+/// upstream cleanup completes, including consumer cancellation.
+fn forward_replay_stream(
+    mut live: LlmJsonStream,
+    call: super::fixture::ReplayCall,
+) -> LlmJsonStream {
+    let (tx, rx) = tokio::sync::mpsc::channel(STREAM_TEE_CHANNEL_CAP);
+    let (cancel, mut canceled) = watch::channel(false);
+    let (closed_tx, closed) = watch::channel(None);
+    tokio::spawn(async move {
+        loop {
+            let item = tokio::select! {
+                _ = canceled.changed() => break,
+                item = live.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
+            let failed = item.is_err();
+            if failed {
+                call.failure("failed_call");
+            }
+            let sent = tokio::select! {
+                _ = canceled.changed() => break,
+                sent = tx.send(TeeMessage::Chunk(item)) => sent,
+            };
+            if failed || sent.is_err() {
+                break;
+            }
+        }
+        let result = live.close().await;
+        if result.is_err() {
+            call.failure("failed_call");
+        }
+        drop(call);
+        closed_tx.send_replace(Some(result));
+    });
+    LlmJsonStream::from_closeable(ResponseCacheReceiver {
+        receiver: ReceiverStream::new(rx),
+        cancel,
+        closed,
+        finished: false,
+    })
+}
+
+struct ReplayGuardStream {
+    inner: LlmJsonStream,
+    call: Option<super::fixture::ReplayCall>,
+}
+
+impl Stream for ReplayGuardStream {
+    type Item = FlowResult<Json>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let result = Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(result, Poll::Ready(None)) {
+            self.call.take();
+        }
+        result
+    }
+}
+
+impl LlmStreamInner for ReplayGuardStream {
+    fn close(self: Pin<&mut Self>) -> Pin<Box<dyn Future<Output = FlowResult<()>> + Send + '_>> {
+        let this = self.get_mut();
+        let call = this.call.take();
+        let close = this.inner.close();
+        Box::pin(async move {
+            let result = close.await;
+            drop(call);
+            result
+        })
+    }
+}
+
+fn guard_stream(inner: LlmJsonStream, call: super::fixture::ReplayCall) -> LlmJsonStream {
+    LlmJsonStream::from_closeable(ReplayGuardStream {
+        inner,
+        call: Some(call),
+    })
+}
