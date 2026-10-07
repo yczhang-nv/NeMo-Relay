@@ -22,7 +22,7 @@ use super::store::{BoxCacheFuture, CACHE_SCHEMA_VERSION, CacheEntry, CacheStore,
 use crate::config::ResponseCacheConfig;
 use crate::error::{AdaptiveError, Result};
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// Counts for one managed execution surface.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,6 +93,10 @@ struct FixtureEntry {
     surface: String,
     key_hash: String,
     response: Json,
+    // Responses clients consume item completion order, which the final
+    // aggregate does not preserve. Keep the original native frames as well.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_stream: Option<Vec<Json>>,
     recorded_unix_ms: u64,
     identity: Json,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -326,7 +330,10 @@ impl ReplaySession {
                 }
                 let key = entry.key_hash.clone();
                 if let Some(previous) = state.entries.get(&key) {
-                    if previous.surface != entry.surface || previous.response != entry.response {
+                    if previous.surface != entry.surface
+                        || previous.response != entry.response
+                        || previous.response_stream != entry.response_stream
+                    {
                         return Err(fixture_error(
                             "recording_conflict: duplicate key responses disagree",
                         ));
@@ -428,6 +435,25 @@ impl ReplaySession {
     }
 
     pub(crate) fn lookup(&self, call: &mut ReplayCall, key: &str) -> Option<Json> {
+        self.lookup_entry(call, key, |entry| entry.response.clone())
+    }
+
+    pub(crate) fn lookup_stream(
+        &self,
+        call: &mut ReplayCall,
+        key: &str,
+    ) -> Option<(Json, Option<Vec<Json>>)> {
+        self.lookup_entry(call, key, |entry| {
+            (entry.response.clone(), entry.response_stream.clone())
+        })
+    }
+
+    fn lookup_entry<T>(
+        &self,
+        call: &mut ReplayCall,
+        key: &str,
+        read: impl FnOnce(&FixtureEntry) -> T,
+    ) -> Option<T> {
         call.key = Some(key.into());
         if self.config.mode == ReplayMode::Record {
             return None;
@@ -437,7 +463,7 @@ impl ReplaySession {
             .entries
             .get(key)
             .filter(|e| e.surface == call.surface)
-            .map(|e| e.response.clone());
+            .map(read);
         let counts = counts(state.report.as_mut().unwrap(), &call.surface);
         if response.is_none() {
             counts.misses += 1;
@@ -453,6 +479,22 @@ impl ReplaySession {
     }
 
     pub(crate) fn capture(&self, call: &mut ReplayCall, entry: CacheEntry, request: Json) {
+        self.capture_stream(call, entry, request, None);
+    }
+
+    pub(crate) fn stream_limit_exceeded(&self, call: &ReplayCall) {
+        let mut state = self.state.lock().expect("replay lock poisoned");
+        state.report.as_mut().unwrap().failed_writes += 1;
+        call.failure_locked(&mut state, "persistence_error");
+    }
+
+    pub(crate) fn capture_stream(
+        &self,
+        call: &mut ReplayCall,
+        entry: CacheEntry,
+        request: Json,
+        response_stream: Option<Vec<Json>>,
+    ) {
         if self.strict() {
             return;
         }
@@ -460,6 +502,7 @@ impl ReplaySession {
             surface: call.surface.clone(),
             key_hash: entry.key_hash,
             response: entry.response,
+            response_stream,
             recorded_unix_ms: entry.created_unix_ms,
             identity: if call.surface == "tool" {
                 json!({"tool": call.identity, "version": entry.model_name})
@@ -470,10 +513,27 @@ impl ReplaySession {
         };
         let mut state = self.state.lock().expect("replay lock poisoned");
         if let Some(previous) = state.entries.get(&entry.key_hash) {
-            if previous.response != entry.response || previous.surface != entry.surface {
+            if previous.response != entry.response
+                || previous.surface != entry.surface
+                || (previous.response_stream.is_some()
+                    && entry.response_stream.is_some()
+                    && previous.response_stream != entry.response_stream)
+            {
                 state.report.as_mut().unwrap().conflicts += 1;
                 call.failure_locked(&mut state, "recording_conflict");
                 return;
+            }
+            if previous.response_stream.is_none() && entry.response_stream.is_some() {
+                let previous_size = entry_bytes(previous).unwrap_or(usize::MAX);
+                let size = entry_bytes(&entry).unwrap_or(usize::MAX);
+                let additional = size.saturating_sub(previous_size);
+                if additional > self.max_bytes.saturating_sub(state.bytes) {
+                    state.report.as_mut().unwrap().failed_writes += 1;
+                    call.failure_locked(&mut state, "persistence_error");
+                    return;
+                }
+                state.bytes += additional;
+                state.entries.insert(entry.key_hash.clone(), entry);
             }
         } else {
             let size = entry_bytes(&entry).unwrap_or(usize::MAX);

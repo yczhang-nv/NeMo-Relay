@@ -590,6 +590,88 @@ fn startup_status_reports_not_configured_when_no_exporters() {
     assert!(output.contains("Exporters      not configured"));
 }
 
+#[tokio::test]
+async fn gateway_shutdown_publishes_replay_before_closing_plugins_and_reports_save_errors() {
+    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = directory.path().join("fixture.json");
+    let invalid = directory.path().join("existing-directory");
+    std::fs::create_dir(&invalid).unwrap();
+    std::fs::write(invalid.join("preserved"), "original").unwrap();
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+
+    for (mode, path, should_fail) in [
+        ("record", &fixture, false),
+        ("replay_only", &fixture, false),
+        ("record", &invalid, true),
+    ] {
+        let mut replay = json!({"mode": mode});
+        replay[if mode == "record" {
+            "output_path"
+        } else {
+            "input_path"
+        }] = json!(path.to_string_lossy());
+        let activation = activate_server_plugins(
+            Some(json!({"version": 1, "components": [{
+                "kind": "adaptive", "enabled": true,
+                "config": {"version": 1, "response_cache": {
+                    "namespace": "gateway-replay-test", "replay": replay
+                }}
+            }]})),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let answer = json!({"id": "answer", "object": "chat.completion", "created": 1,
+            "model": "test", "choices": [{"index": 0,
+                "message": {"role": "assistant", "content": "saved answer"},
+                "finish_reason": "stop"}]});
+        let provider_calls = provider_calls.clone();
+        let expected = answer.clone();
+        let result = nemo_relay::api::llm::llm_call_execute(
+            nemo_relay::api::llm::LlmCallExecuteParams::builder()
+                .name("openai")
+                .request(nemo_relay::api::llm::LlmRequest {
+                    headers: Map::new(),
+                    content: json!({"model": "test", "temperature": 0,
+                        "messages": [{"role": "user", "content": "prompt"}]}),
+                })
+                .func(Arc::new(move |_| {
+                    provider_calls.fetch_add(1, Ordering::SeqCst);
+                    let answer = answer.clone();
+                    Box::pin(async move { Ok(answer) })
+                }))
+                .build(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, expected);
+        let sessions = SessionManager::new(test_config());
+        let result = finish_server_shutdown(Ok(()), &sessions, activation, "replay-test").await;
+        if should_fail {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("replay finalization failed")
+            );
+            assert_eq!(
+                std::fs::read_to_string(invalid.join("preserved")).unwrap(),
+                "original"
+            );
+        } else {
+            result.unwrap();
+            let artifact: Value =
+                serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+            assert_eq!(artifact["manifest"]["coverage"]["finalized"], true);
+            assert_eq!(artifact["entries"].as_array().unwrap().len(), 1);
+        }
+        assert!(nemo_relay_adaptive::replay_reports().is_empty());
+        assert_plugin_host_lease_available().await;
+    }
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+}
+
 fn write_missing_native_plugin_manifest(
     dir: &std::path::Path,
     plugin_id: &str,

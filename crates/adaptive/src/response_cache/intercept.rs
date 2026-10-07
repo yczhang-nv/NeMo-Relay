@@ -17,7 +17,9 @@ use nemo_relay::api::runtime::{
     LlmExecutionFn, LlmExecutionNextFn, LlmJsonStream, LlmStreamExecutionFn,
     LlmStreamExecutionNextFn, LlmStreamInner,
 };
-use nemo_relay::codec::resolve::{detect_request_surface_with_hint, streaming_codec};
+use nemo_relay::codec::resolve::{
+    ProviderSurface, detect_request_surface_with_hint, streaming_codec,
+};
 use nemo_relay::codec::streaming::StreamingCodec;
 use nemo_relay::error::Result as FlowResult;
 use serde_json::Value as Json;
@@ -33,7 +35,7 @@ use crate::response_cache::key::{KeyOutcome, build_cache_key};
 use crate::response_cache::mark::{
     CacheMark, CacheMarkStatus, CacheReason, emit_cache_mark, savings_from,
 };
-use crate::response_cache::replay::{replay_aggregate, replay_is_lossy};
+use crate::response_cache::replay::{recorded_stream_is_lossy, replay_aggregate, replay_is_lossy};
 use crate::response_cache::store::{CacheEntry, CacheStore, now_unix_ms};
 
 /// Bounded channel capacity for the streaming tee: it forwards live chunks to
@@ -57,6 +59,7 @@ struct CacheWriteContext {
     model: Option<String>,
     anthropic_context: Option<AnthropicCacheContext>,
     replay_call: Option<(super::fixture::ReplayCall, Json)>,
+    preserve_stream: bool,
 }
 
 /// Receiver half of the streaming cache tee with upstream cleanup forwarding.
@@ -334,6 +337,7 @@ async fn run_cache_stream(
                 model,
                 anthropic_context,
                 replay_call: None,
+                preserve_stream: false,
             },
         ));
     }
@@ -394,6 +398,7 @@ async fn run_cache_stream(
                     model,
                     anthropic_context,
                     replay_call: None,
+                    preserve_stream: false,
                 },
             ))
         }
@@ -433,6 +438,8 @@ fn tee_and_aggregate(
             .anthropic_context
             .as_ref()
             .map(AnthropicStreamValidator::new);
+        let mut response_stream = write.preserve_stream.then(Vec::new);
+        let mut stream_budget = write.config.backend.max_bytes();
         let mut completion = StreamCompletion::default();
         let mut reached_eof = false;
         loop {
@@ -460,6 +467,25 @@ fn tee_and_aggregate(
                         validator.observe(chunk);
                     }
                     completion.observe(chunk);
+                    if let Some(chunks) = &mut response_stream {
+                        let bytes = serde_json::to_vec(chunk).map(|b| b.len().saturating_add(1));
+                        if let Ok(bytes) = bytes
+                            && bytes <= stream_budget
+                        {
+                            stream_budget -= bytes;
+                            chunks.push(chunk.clone());
+                        } else {
+                            response_stream = None;
+                            collector_failed = true;
+                            if let Some((call, _)) = &write.replay_call {
+                                write
+                                    .store
+                                    .replay_session()
+                                    .expect("replay session")
+                                    .stream_limit_exceeded(call);
+                            }
+                        }
+                    }
                 }
                 Err(_) => {
                     // Upstream error is a failed call: forward it, never cache.
@@ -504,12 +530,15 @@ fn tee_and_aggregate(
             if !aggregate_has_no_content(&aggregate)
                 && !aggregate_replay_lossy(&aggregate)
                 && anthropic_valid
+                && (response_stream.is_some()
+                    || write.replay_call.is_none()
+                    || !replay_is_lossy(&aggregate, anthropic_kind))
             {
                 let write_is_replay = write.replay_call.is_some();
                 let commit: CacheCommit = Box::pin(async move {
                     if let Some((mut call, request)) = write.replay_call {
                         let session = write.store.replay_session().expect("replay session");
-                        session.capture(
+                        session.capture_stream(
                             &mut call,
                             CacheEntry::new(
                                 aggregate,
@@ -519,6 +548,7 @@ fn tee_and_aggregate(
                                 Some(write.provider),
                             ),
                             request,
+                            response_stream,
                         );
                         return;
                     }
@@ -946,14 +976,22 @@ async fn run_replay_stream(
         }
     };
     let context = cache_context(&request).expect("accepted cache context");
-    if let Some(response) = session.lookup(&mut call, &key) {
+    if let Some((response, recorded_stream)) = session.lookup_stream(&mut call, &key) {
         let kind = context
             .as_ref()
             .and_then(|context| classify_aggregate(&response, context));
-        if (context.is_none() || kind.is_some()) && !replay_is_lossy(&response, kind) {
+        let lossy = recorded_stream.as_ref().map_or_else(
+            || replay_is_lossy(&response, kind),
+            |chunks| recorded_stream_is_lossy(&response, chunks),
+        );
+        if (context.is_none() || kind.is_some()) && !lossy {
             call.hit();
             emit_cache_mark(CacheMark::new(CacheMarkStatus::Hit, "replay").key_hash(&key));
-            return Ok(guard_stream(replay_aggregate(response, kind), call));
+            let stream = match recorded_stream {
+                Some(chunks) => LlmJsonStream::new(tokio_stream::iter(chunks.into_iter().map(Ok))),
+                None => replay_aggregate(response, kind),
+            };
+            return Ok(guard_stream(stream, call));
         }
         if session.strict() {
             return Err(call.error("stream_not_replayable"));
@@ -987,6 +1025,7 @@ async fn run_replay_stream(
             model,
             anthropic_context: context,
             replay_call: Some((call, body)),
+            preserve_stream: surface == ProviderSurface::OpenAIResponses,
         },
     ))
 }

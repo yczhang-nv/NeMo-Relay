@@ -405,6 +405,7 @@ async fn finish_server_shutdown(
     instance_id: &str,
 ) -> Result<(), CliError> {
     let close_result = sessions.close_all("gateway_shutdown").await;
+    let replay_result = finalize_server_replay().await;
     let flush_result = nemo_relay::api::runtime::flush_subscribers().map_err(CliError::from);
     let clear_result = plugin_activation
         .map(ServerPluginActivation::clear)
@@ -417,11 +418,24 @@ async fn finish_server_shutdown(
             error_kind = "io";
             "Gateway server failed"
         );
-        log_server_teardown_results(&close_result, &flush_result, &clear_result, instance_id);
+        log_server_teardown_results(
+            &close_result,
+            &replay_result,
+            &flush_result,
+            &clear_result,
+            instance_id,
+        );
         return Err(serve_error.into());
     }
-    log_server_teardown_results(&close_result, &flush_result, &clear_result, instance_id);
+    log_server_teardown_results(
+        &close_result,
+        &replay_result,
+        &flush_result,
+        &clear_result,
+        instance_id,
+    );
     close_result?;
+    replay_result?;
     flush_result?;
     clear_result?;
     log::info!(
@@ -433,14 +447,39 @@ async fn finish_server_shutdown(
     Ok(())
 }
 
+async fn finalize_server_replay() -> Result<(), CliError> {
+    if nemo_relay_adaptive::replay_reports().is_empty() {
+        return Ok(());
+    }
+    let reports = nemo_relay_adaptive::finalize_replay()
+        .await
+        .map_err(|error| CliError::Config(format!("replay finalization failed: {error}")))?;
+    for report in reports {
+        log::info!(
+            target: "nemo_relay.server",
+            event = "replay_finalized",
+            recording_id = report.recording_id.as_str(),
+            llm_hits = report.llm.hits,
+            llm_misses = report.llm.misses,
+            llm_live_calls = report.llm.live_calls,
+            llm_captured = report.llm.captured,
+            llm_uncaptured = report.llm.uncaptured;
+            "Replay session finalized"
+        );
+    }
+    Ok(())
+}
+
 fn log_server_teardown_results(
     close_result: &Result<(), CliError>,
+    replay_result: &Result<(), CliError>,
     flush_result: &Result<(), CliError>,
     clear_result: &Result<(), CliError>,
     instance_id: &str,
 ) {
     for (component, result) in [
         ("sessions", close_result),
+        ("replay", replay_result),
         ("subscribers", flush_result),
         ("plugins", clear_result),
     ] {

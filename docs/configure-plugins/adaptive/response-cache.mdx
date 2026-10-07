@@ -618,6 +618,16 @@ responses and oversized artifacts before registration succeeds. Initialization
 errors propagate to the caller. Frozen entries do not expire or evict, and
 replay ignores ordinary TTL and bypass sampling.
 
+Fixture format 2 preserves the original OpenAI Responses stream frames as well
+as the completed response. Streaming replay retains item completion order,
+which can differ from the final response's output array and affect the
+harness's next request. Buffered calls still receive the completed response.
+The frames count toward the existing memory and fixture budget. Rerecord
+format 1 fixtures; initialization rejects them rather than replaying an
+unrecoverable stream order. Other provider streams must pass a synthesis
+round-trip check before being counted as captured, including the distinction
+between empty-string and null Chat Completions content.
+
 | Replay field | Meaning |
 |---|---|
 | `mode` | Defaults to `record`. |
@@ -715,6 +725,12 @@ captures (`failed_writes`) from publication attempts (`persistence_errors`), so 
 successful save retry can publish all retained captures. `wait_for_idle()` only drains
 telemetry and does not replace recording finalization. Closing a plugin without
 finalizing does not publish a recording.
+
+The Relay CLI gateway finalizes configured replay sessions during graceful
+shutdown, before closing its plugins. A bounded `nemo-relay run` recording is
+therefore published when the harness exits and the gateway shuts down. Forced
+termination does not provide this completion boundary. Publication failures
+are reported as gateway teardown failures.
 
 `replay_reports()` (`replayReports()` in Node.js) snapshots active sessions.
 Reports separate LLM and tool hits, misses, live calls, captures and uncaptured

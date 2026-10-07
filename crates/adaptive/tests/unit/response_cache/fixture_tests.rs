@@ -100,6 +100,158 @@ fn stream_provider(calls: Arc<AtomicUsize>, terminal: bool) -> LlmStreamExecutio
     })
 }
 
+async fn responses_stream(
+    session: Arc<ReplaySession>,
+    cfg: &ResponseCacheConfig,
+    req: LlmRequest,
+    next: LlmStreamExecutionNextFn,
+) -> nemo_relay::error::Result<LlmJsonStream> {
+    make_stream_intercept(session, Arc::new(cfg.clone()))(
+        "openai.responses",
+        req,
+        Default::default(),
+        next,
+    )
+    .await
+}
+async fn responses_buffered(
+    session: Arc<ReplaySession>,
+    cfg: &ResponseCacheConfig,
+    req: LlmRequest,
+    next: LlmExecutionNextFn,
+) -> nemo_relay::error::Result<Json> {
+    make_intercept(session, Arc::new(cfg.clone()))(
+        "openai.responses",
+        req,
+        Default::default(),
+        next,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn responses_fixture_preserves_native_completion_order_and_buffered_answer() {
+    let dir = Directory::new();
+    let path = dir.file("responses.json");
+    let cfg = config(path.clone(), ReplayMode::Record);
+    let session = Arc::new(ReplaySession::load(&cfg).unwrap());
+    let req = LlmRequest {
+        content: json!({"model":"test","input":"prompt","temperature":0,"store":false}),
+        headers: Default::default(),
+    };
+    let tool = json!({"type":"function_call","id":"fc_1","call_id":"call_1",
+        "name":"terminal","arguments":"{}","status":"completed"});
+    let message = json!({"type":"message","id":"msg_1","role":"assistant",
+        "content":[{"type":"output_text","text":"\n\n"}],"status":"completed"});
+    let aggregate = json!({"id":"r1","object":"response","status":"completed",
+        "model":"test","output":[message.clone(),tool.clone()]});
+    let chunks = vec![
+        json!({"type":"response.created","response":{"id":"r1","object":"response","model":"test","status":"in_progress"}}),
+        json!({"type":"response.output_item.done","output_index":1,"item":tool}),
+        json!({"type":"response.output_item.done","output_index":0,"item":message}),
+        json!({"type":"response.completed","response":aggregate}),
+    ];
+    let live_chunks = chunks.clone();
+    let next: LlmStreamExecutionNextFn = Arc::new(move |_| {
+        let chunks = live_chunks.clone();
+        Box::pin(async move {
+            Ok(LlmJsonStream::new(tokio_stream::iter(
+                chunks.into_iter().map(Ok),
+            )))
+        })
+    });
+    let mut live = responses_stream(session.clone(), &cfg, req.clone(), next)
+        .await
+        .unwrap();
+    let mut observed = Vec::new();
+    while let Some(chunk) = live.next().await {
+        observed.push(chunk.unwrap());
+    }
+    live.close().await.unwrap();
+    assert_eq!(observed, chunks);
+    let report = session.finalize().await.unwrap();
+    assert_eq!(report.llm.captured, 1, "{report:?}");
+    let fixture: Fixture = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(fixture.manifest.format_version, 2);
+    assert_eq!(fixture.entries[0].response_stream.as_ref(), Some(&chunks));
+    let mut legacy = fixture;
+    legacy.manifest.format_version = 1;
+    let legacy_path = dir.file("legacy.json");
+    std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(ReplaySession::load(&config(legacy_path, ReplayMode::ReplayOnly)).is_err());
+
+    let cfg = config(path, ReplayMode::ReplayOnly);
+    let session = Arc::new(ReplaySession::load(&cfg).unwrap());
+    let forbidden: LlmStreamExecutionNextFn =
+        Arc::new(|_| Box::pin(async { panic!("strict replay invoked provider") }));
+    let mut replay = responses_stream(session.clone(), &cfg, req.clone(), forbidden)
+        .await
+        .unwrap();
+    let mut observed = Vec::new();
+    while let Some(chunk) = replay.next().await {
+        observed.push(chunk.unwrap());
+    }
+    replay.close().await.unwrap();
+    assert_eq!(
+        observed, chunks,
+        "client-visible completion order must survive disk reload"
+    );
+    assert_eq!(
+        responses_buffered(
+            session.clone(),
+            &cfg,
+            req,
+            Arc::new(|_| Box::pin(async { panic!("buffered replay invoked provider") }))
+        )
+        .await
+        .unwrap(),
+        aggregate
+    );
+    let report = session.finalize().await.unwrap();
+    assert_eq!(report.llm.hits, 2);
+    assert_eq!(report.llm.live_calls, 0);
+}
+
+#[tokio::test]
+async fn responses_stream_capture_respects_memory_budget_without_interrupting_live_delivery() {
+    let dir = Directory::new();
+    let path = dir.file("bounded.json");
+    let mut cfg = config(path.clone(), ReplayMode::Record);
+    cfg.backend.config.insert("max_bytes".into(), json!(4096));
+    let session = Arc::new(ReplaySession::load(&cfg).unwrap());
+    let req = LlmRequest {
+        content: json!({"model":"test","input":"prompt","temperature":0,"store":false}),
+        headers: Default::default(),
+    };
+    let chunks = vec![
+        json!({"type":"response.created","response":{"id":"r1","object":"response","metadata":{"padding":"x".repeat(8192)}}}),
+        json!({"type":"response.completed","response":{"id":"r1","object":"response","status":"completed","model":"test","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}}),
+    ];
+    let next: LlmStreamExecutionNextFn = Arc::new(move |_| {
+        let chunks = chunks.clone();
+        Box::pin(async move {
+            Ok(LlmJsonStream::new(tokio_stream::iter(
+                chunks.into_iter().map(Ok),
+            )))
+        })
+    });
+    let mut live = responses_stream(session.clone(), &cfg, req, next)
+        .await
+        .unwrap();
+    let mut delivered = 0;
+    while let Some(chunk) = live.next().await {
+        chunk.unwrap();
+        delivered += 1;
+    }
+    live.close().await.unwrap();
+    assert_eq!(delivered, 2);
+    let report = session.finalize().await.unwrap();
+    assert_eq!(report.llm.captured, 0);
+    assert_eq!(report.llm.uncaptured, 1);
+    assert_eq!(report.failed_writes, 1, "{report:?}");
+    assert!(ReplaySession::load(&config(path, ReplayMode::ReplayOnly)).is_err());
+}
+
 #[tokio::test]
 async fn disk_roundtrip_is_strict_and_independent_of_expiry_and_sampling() {
     let dir = Directory::new();

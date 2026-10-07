@@ -204,6 +204,25 @@ fn chat_replay_streams_tool_calls_as_deltas() {
     );
 }
 
+#[test]
+fn chat_replay_preserves_empty_content_with_tool_calls() {
+    let mut aggregate = json!({"id": "c1", "object": "chat.completion",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "",
+            "tool_calls": [{"id": "call1", "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"}}]},
+            "finish_reason": "tool_calls"}]});
+    for content in [json!(""), Json::Null] {
+        aggregate["choices"][0]["message"]["content"] = content;
+        assert!(!replay_is_lossy(&aggregate, None));
+        let codec = streaming_codec(ProviderSurface::OpenAIChat);
+        let mut collect = codec.collector();
+        for chunk in synthesize_chat_chunks(&aggregate) {
+            collect(chunk).unwrap();
+        }
+        assert_eq!(codec.finalizer()(), aggregate);
+    }
+}
+
 /// An unknown aggregate shape has no native chunk synthesis, so the streaming
 /// tier must treat it as lossy and run live rather than serve one
 /// aggregate-shaped frame to a strict streaming client.

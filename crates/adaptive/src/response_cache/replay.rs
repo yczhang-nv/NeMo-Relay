@@ -62,6 +62,22 @@ pub(crate) fn replay_is_lossy(
     reassembled != expected
 }
 
+/// Original Responses frames retain the completion order consumed by clients,
+/// even when the provider's final snapshot lists its items in a different order.
+pub(crate) fn recorded_stream_is_lossy(aggregate: &Json, chunks: &[Json]) -> bool {
+    if detect_response_surface(aggregate) != Some(ProviderSurface::OpenAIResponses) {
+        return true;
+    }
+    let codec = streaming_codec(ProviderSurface::OpenAIResponses);
+    let mut collect = codec.collector();
+    for chunk in chunks {
+        if collect(chunk.clone()).is_err() {
+            return true;
+        }
+    }
+    codec.finalizer()() != *aggregate
+}
+
 /// Drops stream-metadata fields the chunk collectors do not aggregate and that
 /// carry no answer content — `system_fingerprint`, `service_tier`, and a null
 /// `logprobs` — so their absence from a replay does not count as loss.
@@ -288,9 +304,7 @@ fn synthesize_chat_choice_chunks(
             json!([{"index": index, "delta": {"role": role}, "finish_reason": null}]),
         ));
     }
-    if let Some(content) = message.get("content").and_then(Json::as_str)
-        && !content.is_empty()
-    {
+    if let Some(content) = message.get("content").and_then(Json::as_str) {
         chunks.push(base(
             json!([{"index": index, "delta": {"content": content}, "finish_reason": null}]),
         ));
