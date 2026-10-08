@@ -352,6 +352,8 @@ Important local entry points:
 - [Getting Started](https://docs.nvidia.com/nemo/relay/getting-started/quick-start)
 - [Installation](https://docs.nvidia.com/nemo/relay/getting-started/installation)
 - [Testing and Docs](https://docs.nvidia.com/nemo/relay/contribute/testing-and-docs)
+- [Codex Replay Demo](examples/replay-demo/README.md): record and strictly replay
+  a source-review task with a live file-reading tool.
 
 For source builds, tests, and contribution workflow, refer to
 [CONTRIBUTING.md](CONTRIBUTING.md).

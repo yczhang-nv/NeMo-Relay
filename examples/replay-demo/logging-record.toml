@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[logging]
+level = "info"
+stderr_enabled = false
+
+[[logging.sinks]]
+path = "examples/replay-demo/artifacts/record.jsonl"
+level = "info"
+format = "jsonl"

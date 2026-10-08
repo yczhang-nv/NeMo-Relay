@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version = 1
+
+[[components]]
+kind = "adaptive"
+enabled = true
+
+[components.config]
+version = 1
+
+[components.config.response_cache]
+namespace = "codex-tool-replay-demo"
+cache_nondeterministic = true
+
+[components.config.response_cache.backend]
+kind = "in_memory"
+
+[components.config.response_cache.replay]
+mode = "replay_only"
+input_path = "examples/replay-demo/artifacts/recording.json"
+capture_requests = true
+
+[components.config.response_cache.replay.tools]
+mode = "live"

@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+Use a shell tool to run exactly:
+cat examples/replay-demo/weighted_mean.py
+
+Then review the function you read. Its intended contract is:
+- Inputs are nonempty sequences of finite numbers with matching lengths.
+- Weights are nonnegative and their total is positive.
+- Invalid inputs raise ValueError.
+
+For values=[2.0, 8.0] and weights=[3.0, 1.0], the expected result is 3.5.
+
+Explain the bugs, provide a corrected standard-library implementation,
+and provide five focused pytest tests covering unequal weights,
+zero-weight samples, mismatched lengths, negative weights, and zero
+total weight.
+
+Do not edit files, run additional commands, or delegate work.
