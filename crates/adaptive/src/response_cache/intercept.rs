@@ -496,12 +496,17 @@ fn tee_and_aggregate(
                     break;
                 }
             }
+            // Responses clients can close after response.completed without
+            // waiting for HTTP EOF. Its complete response and preserved frames
+            // already establish the recording boundary; do not wait for more
+            // bytes or discard the capture when that client disconnects.
+            let responses_complete = write.preserve_stream && completion.is_terminal();
             // Forward to the consumer; a send error means it was dropped.
             let sent = tokio::select! {
                 _ = cancel_rx.changed() => break,
                 sent = tx.send(TeeMessage::Chunk(item)) => sent,
             };
-            if sent.is_err() {
+            if sent.is_err() || responses_complete {
                 break;
             }
         }
@@ -513,7 +518,8 @@ fn tee_and_aggregate(
         }
         // Store only protocol-complete streams: every collector finalizes a
         // clean truncation as a well-formed partial.
-        if reached_eof && close_result.is_ok() && !collector_failed && completion.is_terminal() {
+        let complete = reached_eof || (write.preserve_stream && completion.is_terminal());
+        if complete && close_result.is_ok() && !collector_failed && completion.is_terminal() {
             let aggregate = codec.finalizer()();
             // Empty = mis-inferred surface; lossy = unfaithful replay.
             let anthropic_kind = write

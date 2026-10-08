@@ -213,6 +213,73 @@ async fn responses_fixture_preserves_native_completion_order_and_buffered_answer
 }
 
 #[tokio::test]
+async fn responses_recording_completes_before_transport_eof_across_turns() {
+    let dir = Directory::new();
+    let path = dir.file("responses-terminal.json");
+    let cfg = config(path.clone(), ReplayMode::Record);
+    let session = Arc::new(ReplaySession::load(&cfg).unwrap());
+    let mut turns = Vec::new();
+    for turn in 0..3 {
+        let req = LlmRequest {
+            content: json!({"model":"test","input":format!("turn {turn}"),"temperature":0,"store":false}),
+            headers: Default::default(),
+        };
+        let completed = json!({"type":"response.completed","response":{
+            "id":format!("r{turn}"),"object":"response","status":"completed","model":"test",
+            "output":[{"type":"message","id":format!("msg{turn}"),"role":"assistant","status":"completed",
+                "content":[{"type":"output_text","text":format!("answer {turn}")}]}]
+        }});
+        let live_completed = completed.clone();
+        let next: LlmStreamExecutionNextFn = Arc::new(move |_| {
+            let completed = live_completed.clone();
+            Box::pin(async move {
+                // The provider has completed the response, but its HTTP stream
+                // stays open until the client closes it.
+                Ok(LlmJsonStream::new(
+                    tokio_stream::iter([Ok(completed)]).chain(tokio_stream::pending()),
+                ))
+            })
+        });
+        let mut returned = responses_stream(session.clone(), &cfg, req.clone(), next)
+            .await
+            .unwrap();
+        assert_eq!(returned.next().await.unwrap().unwrap(), completed);
+        if turn == 1 {
+            drop(returned);
+        } else {
+            tokio::time::timeout(Duration::from_secs(2), returned.close())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        turns.push((req, completed));
+    }
+    let report = tokio::time::timeout(Duration::from_secs(2), session.finalize())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.llm.live_calls, 3);
+    assert_eq!(report.llm.captured, 3, "{report:?}");
+    assert_eq!(report.llm.uncaptured, 0);
+
+    let cfg = config(path, ReplayMode::ReplayOnly);
+    let session = Arc::new(ReplaySession::load(&cfg).unwrap());
+    for (req, completed) in turns {
+        let forbidden: LlmStreamExecutionNextFn =
+            Arc::new(|_| Box::pin(async { panic!("strict replay invoked provider") }));
+        let mut replay = responses_stream(session.clone(), &cfg, req, forbidden)
+            .await
+            .unwrap();
+        assert_eq!(replay.next().await.unwrap().unwrap(), completed);
+        assert!(replay.next().await.is_none());
+        replay.close().await.unwrap();
+    }
+    let report = session.finalize().await.unwrap();
+    assert_eq!(report.llm.hits, 3);
+    assert_eq!(report.llm.live_calls, 0);
+}
+
+#[tokio::test]
 async fn responses_stream_capture_respects_memory_budget_without_interrupting_live_delivery() {
     let dir = Directory::new();
     let path = dir.file("bounded.json");

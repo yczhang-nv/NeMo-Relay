@@ -622,6 +622,10 @@ Fixture format 2 preserves the original OpenAI Responses stream frames as well
 as the completed response. Streaming replay retains item completion order,
 which can differ from the final response's output array and affect the
 harness's next request. Buffered calls still receive the completed response.
+Preserved Responses recordings finish at `response.completed` without waiting
+for HTTP EOF, so a client closing after that event does not discard the capture.
+Streams closed before protocol completion remain incomplete and cannot supply
+strict replay coverage.
 The frames count toward the existing memory and fixture budget. Rerecord
 format 1 fixtures; initialization rejects them rather than replaying an
 unrecoverable stream order. Other provider streams must pass a synthesis
