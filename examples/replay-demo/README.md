@@ -25,6 +25,11 @@ Codex settings, prompt, and sample file unchanged between runs. Run both session
 on the same day. Native tool output and environment content can change the next
 model request and cause a strict miss.
 
+Both commands disable Codex connector apps for this demo. Connector tool
+descriptions can change between sessions and cause a first-call miss even when
+the task text is identical. The native shell tool remains available. Changing
+this flag requires a fresh recording.
+
 ## 1. Clone and Build
 
 ```bash
@@ -56,7 +61,7 @@ the terminal prompt.
   --config "$demo/config.toml" \
   --openai-base-url https://api.openai.com/v1 \
   --plugin-config-path "$demo/record.toml" \
-  -- codex exec --ephemeral --sandbox read-only "$task_prompt" \
+  -- codex exec --disable apps --ephemeral --sandbox read-only "$task_prompt" \
   > "$demo/artifacts/record-output.txt" 2>&1
 
 record_status=$?
@@ -124,7 +129,7 @@ printf 'Recorded model calls: %s\n' "$recorded_calls"
   --config "$demo/config.toml" \
   --openai-base-url https://api.openai.com/v1 \
   --plugin-config-path "$demo/replay.toml" \
-  -- codex exec --ephemeral --sandbox read-only "$task_prompt" \
+  -- codex exec --disable apps --ephemeral --sandbox read-only "$task_prompt" \
   > "$demo/artifacts/replay-output.txt" 2>&1
 
 replay_status=$?
