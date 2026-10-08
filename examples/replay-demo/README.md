@@ -37,12 +37,15 @@ cargo build --locked --release -p nemo-relay-cli
 relay="$PWD/target/release/nemo-relay"
 demo="$PWD/examples/replay-demo"
 mkdir -p "$demo/artifacts"
-prompt="$(cat "$demo/prompt.txt")"
+task_prompt="$(cat "$demo/prompt.txt")"
 ```
 
 For an existing clone, pull the feature branch and start at the build command.
 The configurations, prompt, and sample file are already included. Their relative
 paths assume the repository root is the working directory.
+
+Use `task_prompt` as written: in zsh, `prompt` is a special variable that changes
+the terminal prompt.
 
 ## 2. Record the Task
 
@@ -53,7 +56,7 @@ paths assume the repository root is the working directory.
   --config "$demo/config.toml" \
   --openai-base-url https://api.openai.com/v1 \
   --plugin-config-path "$demo/record.toml" \
-  -- codex exec --ephemeral --sandbox read-only "$prompt" \
+  -- codex exec --ephemeral --sandbox read-only "$task_prompt" \
   > "$demo/artifacts/record-output.txt" 2>&1
 
 record_status=$?
@@ -121,7 +124,7 @@ printf 'Recorded model calls: %s\n' "$recorded_calls"
   --config "$demo/config.toml" \
   --openai-base-url https://api.openai.com/v1 \
   --plugin-config-path "$demo/replay.toml" \
-  -- codex exec --ephemeral --sandbox read-only "$prompt" \
+  -- codex exec --ephemeral --sandbox read-only "$task_prompt" \
   > "$demo/artifacts/replay-output.txt" 2>&1
 
 replay_status=$?
