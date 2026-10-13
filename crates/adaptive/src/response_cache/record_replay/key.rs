@@ -121,6 +121,9 @@ impl KeyBuilder {
         matches: &mut BTreeMap<String, u64>,
         reason: &mut Option<String>,
     ) {
+        if let Some(input) = filtered.get_mut("input").filter(|input| input.is_string()) {
+            self.redact_content(input, matches, reason);
+        }
         for key in ["messages", "input"] {
             if let Some(messages) = filtered.get_mut(key).and_then(Json::as_array_mut) {
                 for message in messages {
@@ -317,6 +320,14 @@ mod tests {
         assert_eq!(
             first_difference(&json!({"x":"abc"}), &json!({"x":"abd"})).unwrap()["character_offset"],
             2
+        );
+        let input = |time: &str| LlmRequest {
+            content: json!({"model":"m","input":format!("Time: {time}\nStable")}),
+            headers: Default::default(),
+        };
+        assert_eq!(
+            key.build("op", &input("a"), &cache).hash,
+            key.build("op", &input("b"), &cache).hash
         );
     }
 }

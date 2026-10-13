@@ -664,8 +664,10 @@ async fn tool_signature_failures_preserve_live_results_and_latch_verify() {
             .await
             .unwrap_err()
             .to_string();
+        // A recorded tool that never ran is a completeness leftover, not
+        // a divergence, so it neither latches verify nor writes a tool line.
         assert!(
-            failure.contains(if case == "size" {
+            failure.contains(if matches!(case, "size" | "missing") {
                 "RR-EXHAUSTED"
             } else {
                 "RR-TOOL"
@@ -673,6 +675,15 @@ async fn tool_signature_failures_preserve_live_results_and_latch_verify() {
             "{case}: {failure}"
         );
         assert_eq!(models.load(Ordering::SeqCst), 0);
+        if case == "missing" {
+            assert!(replay.output("tools").is_empty());
+            assert!(
+                replay
+                    .output("divergence")
+                    .iter()
+                    .all(|d| !d["type"].as_str().unwrap().starts_with("tool_"))
+            );
+        }
         if case == "size" {
             assert_eq!(replay.output("tools")[0]["status"], "size_warning");
         }
@@ -918,4 +929,233 @@ async fn forbidden_settings_activate_error_returning_middleware() {
         );
         runtime.shutdown().await.unwrap();
     }
+}
+
+fn chunk(data: Json) -> Chunk {
+    Chunk {
+        offset_us: 1,
+        hermes_paced: None,
+        data,
+    }
+}
+
+#[test]
+fn responses_aggregate_rebuilds_output_and_accepts_incomplete() {
+    let created =
+        json!({"type":"response.created","response":{"id":"r","status":"in_progress","output":[]}});
+    let call_added = json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc","call_id":"c","name":"terminal","arguments":""}});
+    let delta = json!({"type":"response.function_call_arguments.delta","item_id":"fc","output_index":1,"delta":"{}"});
+    let call_done = json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc","call_id":"c","name":"terminal","arguments":"{}"}});
+    let message_done = json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m","content":[]}});
+    let reasoning_done = json!({"type":"response.output_item.done","output_index":2,"item":{"type":"reasoning","id":"rs","encrypted_content":"blob"}});
+    let terminal = |kind: &str| json!({"type":kind,"response":{"id":"r","status":"x","output":null,"usage":{"output_tokens":3}}});
+    let stream = |last: Json| {
+        [
+            created.clone(),
+            call_added.clone(),
+            delta.clone(),
+            call_done.clone(),
+            message_done.clone(),
+            reasoning_done.clone(),
+            last,
+        ]
+        .into_iter()
+        .map(chunk)
+        .collect::<Vec<_>>()
+    };
+    for (kind, ok) in [
+        ("response.completed", true),
+        ("response.incomplete", true),
+        ("response.failed", false),
+    ] {
+        let (response, terminal_ok) = stream::aggregate(&stream(terminal(kind)));
+        assert_eq!(terminal_ok, ok, "{kind}");
+        assert_eq!(response["usage"]["output_tokens"], 3);
+        let types: Vec<_> = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].clone())
+            .collect();
+        assert_eq!(types, ["message", "function_call", "reasoning"]);
+        assert_eq!(response["output"][2]["encrypted_content"], "blob");
+    }
+    // Without a terminal event the base is the last created snapshot, and the call is not ok.
+    let (response, ok) = stream::aggregate(&[chunk(created.clone()), chunk(message_done.clone())]);
+    assert!(!ok);
+    assert_eq!(response["status"], "in_progress");
+    // A completed response settles an announced call that never got a done event.
+    let (response, ok) =
+        stream::aggregate(&[created, call_added, delta, terminal("response.completed")].map(chunk));
+    assert!(ok);
+    assert_eq!(response["output"][0]["arguments"], "{}");
+}
+
+#[tokio::test]
+async fn responses_incomplete_stream_is_recorded_ok() {
+    let dirs = Dirs::new();
+    let session = Session::activate(dirs.cache("record"), false);
+    let next: LlmStreamExecutionNextFn = Arc::new(|_| {
+        Box::pin(async {
+            Ok(LlmJsonStream::new(tokio_stream::iter(
+                [
+                    json!({"type":"response.created","response":{"id":"r","output":[]}}),
+                    json!({"type":"response.incomplete","response":{"id":"r","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"output_tokens":1}}}),
+                ]
+                .map(Ok),
+            )))
+        })
+    });
+    let mut stream = streaming(session.clone(), None, next).await;
+    while stream.next().await.is_some() {}
+    session.close();
+    let line = json_lines(&dirs.trace.join("calls.jsonl"))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(line["outcome"], "ok");
+    assert_eq!(line["usage_chunk"], true);
+    assert_eq!(
+        line["response"]["incomplete_details"]["reason"],
+        "max_output_tokens"
+    );
+}
+
+#[tokio::test]
+async fn consumer_clock_marks_waiting_and_prefetched_items() {
+    for prefetched in [false, true] {
+        let dirs = Dirs::new();
+        let session = Session::activate(dirs.cache("record"), false);
+        let clock = StreamConsumerClock::default();
+        let mut stream = streaming(
+            session.clone(),
+            Some(clock.clone()),
+            stream_provider(Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
+        loop {
+            if !prefetched {
+                // The caller asks before the recorder sees the item: it was waiting.
+                clock.requested();
+                clock.requested();
+            }
+            match stream.next().await {
+                Some(item) => {
+                    item.unwrap();
+                    if !prefetched {
+                        clock.delivered();
+                    }
+                }
+                None => break,
+            }
+        }
+        // The producer ended, so the call is no longer in flight.
+        assert!(!lock(&session.state.data).busy);
+        if prefetched {
+            for _ in frames() {
+                clock.requested();
+                clock.delivered();
+            }
+            clock.requested();
+        }
+        clock.finish(true);
+        session.close();
+        let line = json_lines(&dirs.trace.join("calls.jsonl"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(line["outcome"], "ok");
+        assert!(
+            line["chunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["hermes_paced"] == prefetched),
+            "{line}"
+        );
+        assert_eq!(line["end_hermes_paced"], prefetched);
+    }
+}
+
+#[tokio::test]
+async fn held_stream_does_not_block_the_next_call() {
+    let dirs = Dirs::new();
+    let session = Session::activate(dirs.cache("record"), false);
+    let clock = StreamConsumerClock::default();
+    let mut stream = streaming(
+        session.clone(),
+        Some(clock.clone()),
+        stream_provider(Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    while stream.next().await.is_some() {}
+    // The consumer still holds the stream, but the upstream already ended.
+    unary(
+        session.clone(),
+        request("other"),
+        provider(Arc::new(AtomicUsize::new(0))),
+    )
+    .await
+    .unwrap();
+    clock.finish(false);
+    session.close();
+    assert_eq!(dirs.output("record_status")[0]["in_flight"], false);
+}
+
+#[tokio::test]
+async fn fail_closed_tools_still_run_live() {
+    let dirs = Dirs::new();
+    let mut cfg = dirs.cache("replay");
+    cfg.record_replay = Some(Json::Null);
+    let session = Session::activate(cfg, false);
+    let next: ToolExecutionNextFn = Arc::new(|_| {
+        Box::pin(async {
+            Ok(ToolExecutionResult {
+                result: json!({"exit_code":0}),
+                annotation: None,
+            })
+        })
+    });
+    let result = tool::make_tool(session)(ToolExecutionContext::new("terminal", json!({})), next)
+        .await
+        .unwrap();
+    assert_eq!(result.result, json!({"exit_code":0}));
+}
+
+#[tokio::test]
+async fn cancelled_buffered_replay_writes_a_dropped_timing_line() {
+    let dirs = recorded_buffered().await;
+    let mut call = json_lines(&dirs.trace.join("calls.jsonl"))
+        .unwrap()
+        .pop()
+        .unwrap();
+    call["total_us"] = json!(60_000_000);
+    fs::write(dirs.trace.join("calls.jsonl"), format!("{call}\n")).unwrap();
+    let mut cfg = dirs.cache("replay");
+    cfg.record_replay.as_mut().unwrap()["latency_scale"] = json!(1);
+    let session = Session::activate(cfg, false);
+    let task = tokio::spawn(unary(
+        session.clone(),
+        request("stable"),
+        provider(Arc::new(AtomicUsize::new(0))),
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    task.abort();
+    let _ = task.await;
+    let timing = dirs.output("timing");
+    assert_eq!(timing.len(), 1);
+    assert_eq!(timing[0]["outcome"], "consumer_dropped");
+    assert!(!lock(&session.state.data).busy);
+}
+
+#[test]
+fn an_existing_record_lock_reports_trace_locked() {
+    let dirs = Dirs::new();
+    fs::write(dirs.trace.join("record.lock"), "{}\n").unwrap();
+    fs::write(dirs.trace.join("calls.jsonl"), "").unwrap();
+    let session = Session::activate(dirs.cache("record"), false);
+    assert_eq!(
+        lock(&session.state.data).fail.as_deref(),
+        Some("trace_locked")
+    );
 }

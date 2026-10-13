@@ -62,13 +62,16 @@ impl StreamConsumerClock {
     pub fn if_enabled() -> Option<Self> {
         (RECORDERS.load(Ordering::Acquire) > 0).then(Self::default)
     }
-    /// Timestamp entry to one caller-visible next operation.
+    /// Timestamp the caller's first request for the next undelivered item.
+    ///
+    /// A request that is cancelled or answered with an error leaves that item
+    /// undelivered, so a repeated request keeps the first timestamp and poll
+    /// indexes stay aligned with item indexes.
     pub fn requested(&self) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .polls
-            .push(Instant::now());
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.polls.len() <= state.delivered.len() {
+            state.polls.push(Instant::now());
+        }
     }
     /// Whether this item was produced before the caller requested it.
     pub fn was_prefetched(&self, index: usize, available: Instant) -> bool {
@@ -132,4 +135,23 @@ pub async fn with_stream_consumer_clock<F: Future>(
     future: F,
 ) -> F::Output {
     CLOCK.scope(clock, future).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_requests_keep_poll_indexes_aligned() {
+        let clock = StreamConsumerClock::default();
+        clock.requested();
+        // A cancelled or failed request is retried before item 0 is delivered.
+        clock.requested();
+        assert!(!clock.was_prefetched(0, Instant::now()));
+        // No request exists yet for item 1, so it is available before its poll.
+        assert!(clock.was_prefetched(1, Instant::now()));
+        clock.delivered();
+        clock.requested();
+        assert!(!clock.was_prefetched(1, Instant::now()));
+    }
 }

@@ -47,13 +47,19 @@ pub fn snapshot() -> CpuSnapshot {
                     .and_then(|v| v.trim().parse().ok())
             })
         });
+    // The /proc walk is only needed when the cgroup counter is unavailable.
+    let live_descendants_us = if cgroup_usage_us.is_none() {
+        live_cpu()
+    } else {
+        0
+    };
     CpuSnapshot {
         self_user_us,
         self_sys_us,
         children_user_us,
         children_sys_us,
         cgroup_usage_us,
-        live_descendants_us: live_cpu(),
+        live_descendants_us,
     }
 }
 

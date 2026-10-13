@@ -9,6 +9,7 @@ plugins remain separate top-level components managed through ``nemo_relay.plugin
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from typing import Literal, Protocol, TypedDict, cast
@@ -380,8 +381,11 @@ class ToolCacheConfig:
 class StartGateConfig:
     """First-model-call gate; timeout starts when the agent becomes ready."""
 
-    path: str
+    path: str | os.PathLike[str]
     timeout_seconds: int = 3600
+
+    def __post_init__(self) -> None:
+        self.path = os.fspath(self.path)
 
 
 @dataclass(slots=True)
@@ -424,12 +428,16 @@ class RecordReplayConfig:
     """
 
     mode: Literal["record", "verify", "replay"]
-    trace_directory: str
-    output_directory: str
+    trace_directory: str | os.PathLike[str]
+    output_directory: str | os.PathLike[str]
     latency_scale: float = 1.0
     start_gate: StartGateConfig | None = None
     key_filters: KeyFiltersConfig | None = None
     divergence: DivergenceConfig | None = None
+
+    def __post_init__(self) -> None:
+        self.trace_directory = os.fspath(self.trace_directory)
+        self.output_directory = os.fspath(self.output_directory)
 
     def to_dict(self) -> JsonObject:
         """Serialize only configured optional sections for native validation."""
@@ -634,8 +642,13 @@ __all__ = [
     "ConfigPolicy",
     "ConfigReport",
     "ComponentSpec",
+    "DivergenceConfig",
+    "KeyFiltersConfig",
+    "RecordReplayConfig",
+    "RedactBlock",
     "ResponseCacheConfig",
     "ResponseCacheKeyStrategy",
+    "StartGateConfig",
     "StateConfig",
     "TelemetryConfig",
     "ToolCacheConfig",

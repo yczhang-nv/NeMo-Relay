@@ -86,3 +86,17 @@ def test_python_work_progresses_during_replay_deadlines(tmp_path: Path) -> None:
     timing = lines(tmp_path / "timed", "timing")[0]
     assert timing["scheduled_end_us"] == 400000 and timing["outcome"] == "complete"
     assert timing["actual_end_us"] >= timing["scheduled_end_us"]
+
+
+def test_record_replay_config_accepts_path_objects(tmp_path: Path) -> None:
+    from nemo_relay.adaptive import RecordReplayConfig, StartGateConfig
+
+    config = RecordReplayConfig(
+        mode="verify",
+        trace_directory=tmp_path / "trace",
+        output_directory=tmp_path / "out",
+        start_gate=StartGateConfig(path=tmp_path / "go"),
+    ).to_dict()
+    assert config["trace_directory"] == str(tmp_path / "trace")
+    assert config["output_directory"] == str(tmp_path / "out")
+    assert config["start_gate"]["path"] == str(tmp_path / "go")

@@ -60,17 +60,18 @@ pub fn make_buffered(session: Arc<Session>) -> LlmExecutionFn {
                 result
             } else {
                 let entry = run.entry.as_ref().expect("matched entry");
-                let deadline = deadline(run.t0, entry.total_us, session.config.latency_scale)?;
+                let deadline = checked_deadline(&session, &run, entry.total_us)?;
+                let response = entry.response.clone();
+                // Writes the timing line even when the caller cancels the wait.
+                let mut timing = BufferedTiming {
+                    session: session.clone(),
+                    run: Some(run),
+                    complete: false,
+                };
                 tokio::time::sleep_until(deadline).await;
-                let actual = run.t0.elapsed().as_micros() as u64;
-                let scheduled = scaled_us(entry.total_us, session.config.latency_scale);
-                session.completed_model(&run);
-                session.output("timing",json!({"seq":run.seq,"key_hash":run.key.hash,"repeat_index":run.repeat,"stream":false,
-                    "outcome":"complete","t0_mono_ns":mono_ns().saturating_sub(run.t0.elapsed().as_nanos() as u64),
-                    "scheduled_first_us":null,"actual_first_us":null,"scheduled_end_us":scheduled,"actual_end_us":actual,
-                    "lateness_us":{"p50":actual.saturating_sub(scheduled),"p99":actual.saturating_sub(scheduled),"max":actual.saturating_sub(scheduled)},
-                    "chunks":0,"gate_wait_ms":run.gate_wait_ms,"cpu":{"start":run.cpu_start,"end":cpu::snapshot()}}));
-                Ok(entry.response.clone())
+                timing.complete = true;
+                drop(timing);
+                Ok(response)
             }
         })
     })
@@ -138,12 +139,9 @@ pub fn make_stream(session: Arc<Session>) -> LlmStreamExecutionFn {
                     .as_ref()
                     .expect("stream entry")
                     .iter()
-                    .map(|c| deadline(run.t0, c.offset_us, session.config.latency_scale))
-                    .chain(std::iter::once(deadline(
-                        run.t0,
-                        entry.total_us,
-                        session.config.latency_scale,
-                    )))
+                    .map(|c| c.offset_us)
+                    .chain(std::iter::once(entry.total_us))
+                    .map(|us| checked_deadline(&session, &run, us))
                     .collect::<Result<_>>()?;
                 let t0_mono_ns = mono_ns().saturating_sub(run.t0.elapsed().as_nanos() as u64);
                 let state = Arc::new(Mutex::new(Replaying {
@@ -230,15 +228,14 @@ impl Stream for RecordStream {
                 let mut state = lock(&this.state);
                 if let Some(run) = &state.run {
                     let offset = run.t0.elapsed().as_micros() as u64;
-                    let paced = this.clock.as_ref().and_then(|clock| {
-                        clock
-                            .was_prefetched(state.chunks.len(), std::time::Instant::now())
-                            .then_some(true)
+                    let paced = this.clock.as_ref().map(|clock| {
+                        clock.was_prefetched(state.chunks.len(), std::time::Instant::now())
                     });
+                    // `response.incomplete` is a normal terminal.
                     state.error |= data.get("error").is_some_and(|e| !e.is_null())
                         || matches!(
                             data.get("type").and_then(Json::as_str),
-                            Some("response.failed" | "response.incomplete" | "error")
+                            Some("response.failed" | "error")
                         );
                     state.chunks.push(Chunk {
                         offset_us: offset,
@@ -256,14 +253,18 @@ impl Stream for RecordStream {
                 this.finished = true;
                 {
                     let mut state = lock(&this.state);
-                    if let Some(run) = &state.run {
-                        state.total_us = Some(run.t0.elapsed().as_micros() as u64);
+                    let index = state.chunks.len();
+                    if let Some(run) = state.run.as_mut() {
+                        let total = run.t0.elapsed().as_micros() as u64;
+                        // The upstream ended, so the call is no longer in flight,
+                        // even while the consumer receipt is still pending.
+                        run.guard.take();
+                        state.total_us = Some(total);
                         state.cpu_end = Some(cpu::snapshot());
-                        state.end_paced = this.clock.as_ref().and_then(|clock| {
-                            clock
-                                .was_prefetched(state.chunks.len(), std::time::Instant::now())
-                                .then_some(true)
-                        });
+                        state.end_paced = this
+                            .clock
+                            .as_ref()
+                            .map(|clock| clock.was_prefetched(index, std::time::Instant::now()));
                         state.producer_ended = true;
                     }
                 }
@@ -394,7 +395,13 @@ impl Stream for ReplayStream {
             Poll::Ready(Some(Ok(data)))
         } else {
             this.finished = true;
-            lock(&this.state).producer_ended = true;
+            {
+                let mut state = lock(&this.state);
+                state.producer_ended = true;
+                if let Some(run) = state.run.as_mut() {
+                    run.guard.take();
+                }
+            }
             if this.clock.is_none() {
                 finalize_replay(&this.state, None);
             }
@@ -433,38 +440,20 @@ fn finalize_replay(state: &Arc<Mutex<Replaying>>, receipt: Option<StreamConsumer
     if complete {
         state.session.completed_model(&run);
     }
-    let actual = if let Some(receipt) = &receipt {
-        let mut actual: Vec<_> = receipt
-            .delivered
-            .iter()
-            .map(|stamp| {
-                Instant::from_std(*stamp)
-                    .saturating_duration_since(run.t0)
-                    .as_micros() as u64
-            })
-            .collect();
-        actual.push(
-            Instant::from_std(receipt.ended)
-                .saturating_duration_since(run.t0)
-                .as_micros() as u64,
-        );
-        actual
-    } else {
-        state.actual.clone()
-    };
+    // Timing describes the paced stream's own releases; the consumer
+    // receipt decides only whether the caller received the whole answer.
+    let actual = &state.actual;
     let scale = state.session.config.latency_scale;
+    let released = actual
+        .len()
+        .saturating_sub(usize::from(state.producer_ended))
+        .min(chunks.len());
     let delivered = receipt
         .as_ref()
-        .map(|r| r.delivered.len())
-        .unwrap_or_else(|| {
-            state
-                .actual
-                .len()
-                .saturating_sub(usize::from(state.producer_ended))
-        });
+        .map_or(released, |r| r.delivered.len().min(released));
     let mut lateness: Vec<_> = actual
         .iter()
-        .take(delivered.min(chunks.len()))
+        .take(released)
         .zip(chunks)
         .map(|(actual, chunk)| actual.saturating_sub(scaled_us(chunk.offset_us, scale)))
         .collect();
@@ -485,10 +474,49 @@ fn finalize_replay(state: &Arc<Mutex<Replaying>>, receipt: Option<StreamConsumer
     };
     state.session.output("timing",json!({"seq":run.seq,"key_hash":run.key.hash,"repeat_index":run.repeat,"stream":true,
         "outcome":if complete{"complete"}else{"consumer_dropped"},"t0_mono_ns":state.t0_mono_ns,
-        "scheduled_first_us":state.entry.ttft_us.map(|v|scaled_us(v,scale)),"actual_first_us":actual.first().filter(|_|delivered>0),
+        "scheduled_first_us":state.entry.ttft_us.map(|v|scaled_us(v,scale)),"actual_first_us":actual.first().filter(|_|released>0),
         "scheduled_end_us":scaled_us(state.entry.total_us,scale),"actual_end_us":end,
         "lateness_us":{"p50":quantile(0.5),"p99":quantile(0.99),"max":lateness.last().copied().unwrap_or(0)},
         "chunks":delivered,"gate_wait_ms":run.gate_wait_ms,"cpu":{"start":run.cpu_start,"end":cpu::snapshot()}}));
+}
+
+/// Computes a replay deadline, reporting an overflow as a divergence line.
+fn checked_deadline(session: &Session, run: &Run, us: u64) -> Result<Instant> {
+    deadline(run.t0, us, session.config.latency_scale).inspect_err(|_| {
+        session.divergence(
+            run.seq,
+            "RR-UNAVAILABLE",
+            run.key.hash.as_deref(),
+            run.repeat,
+            json!({"reason":"deadline_overflow","recorded_us":us}),
+        );
+    })
+}
+
+struct BufferedTiming {
+    session: Arc<Session>,
+    run: Option<Run>,
+    complete: bool,
+}
+impl Drop for BufferedTiming {
+    fn drop(&mut self) {
+        let Some(run) = self.run.take() else {
+            return;
+        };
+        let session = &self.session;
+        let entry = run.entry.as_ref().expect("matched entry");
+        let actual = run.t0.elapsed().as_micros() as u64;
+        let scheduled = scaled_us(entry.total_us, session.config.latency_scale);
+        if self.complete {
+            session.completed_model(&run);
+        }
+        let late = actual.saturating_sub(scheduled);
+        session.output("timing",json!({"seq":run.seq,"key_hash":run.key.hash,"repeat_index":run.repeat,"stream":false,
+            "outcome":if self.complete{"complete"}else{"consumer_dropped"},"t0_mono_ns":mono_ns().saturating_sub(run.t0.elapsed().as_nanos() as u64),
+            "scheduled_first_us":null,"actual_first_us":null,"scheduled_end_us":scheduled,"actual_end_us":actual,
+            "lateness_us":{"p50":late,"p99":late,"max":late},
+            "chunks":0,"gate_wait_ms":run.gate_wait_ms,"cpu":{"start":run.cpu_start,"end":cpu::snapshot()}}));
+    }
 }
 
 fn deadline(t0: Instant, us: u64, scale: f64) -> Result<Instant> {
@@ -502,18 +530,21 @@ fn scaled_us(us: u64, scale: f64) -> u64 {
 }
 
 pub fn aggregate(chunks: &[Chunk]) -> (Json, bool) {
+    if chunks.iter().any(|chunk| {
+        chunk
+            .data
+            .get("type")
+            .and_then(Json::as_str)
+            .is_some_and(|kind| kind.starts_with("response."))
+    }) {
+        return aggregate_responses(chunks);
+    }
     let mut response = json!({"object":"chat.completion"});
     let mut choices: BTreeMap<u64, Json> = BTreeMap::new();
     let mut tools: BTreeMap<(u64, u64), Json> = BTreeMap::new();
     let mut terminal = false;
     for chunk in chunks {
         let data = &chunk.data;
-        if data.get("type").and_then(Json::as_str) == Some("response.completed") {
-            return (
-                data.get("response").cloned().unwrap_or(Json::Null),
-                data.get("response").is_some_and(Json::is_object),
-            );
-        }
         for key in ["id", "model", "created", "system_fingerprint"] {
             if response.get(key).is_none()
                 && let Some(value) = data.get(key)
@@ -535,24 +566,7 @@ pub fn aggregate(chunks: &[Chunk]) -> (Json, bool) {
                 .entry(index)
                 .or_insert_with(|| json!({"index":index,"message":{}}));
             if let Some(delta) = choice.get("delta").and_then(Json::as_object) {
-                for (key, value) in delta {
-                    if key == "tool_calls" {
-                        merge_tool_deltas(index, value, &mut tools);
-                    } else if key == "role" {
-                        if output["message"].get(key).is_none() {
-                            output["message"][key] = value.clone();
-                        }
-                    } else if let Some(text) = value.as_str() {
-                        let mut accumulated = output["message"][key]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string();
-                        accumulated.push_str(text);
-                        output["message"][key] = json!(accumulated);
-                    } else {
-                        output["message"][key] = value.clone();
-                    }
-                }
+                merge_chat_delta(index, delta, &mut output["message"], &mut tools);
             }
             for key in ["finish_reason", "logprobs"] {
                 if let Some(value) = choice.get(key) {
@@ -576,6 +590,115 @@ pub fn aggregate(chunks: &[Chunk]) -> (Json, bool) {
     }
     response["choices"] = json!(choices.into_values().collect::<Vec<_>>());
     (response, terminal)
+}
+
+/// Builds a Responses aggregate the way a stream consumer assembles it:
+/// the terminal `response` object, with `output` rebuilt from the
+/// `response.output_item.done` items in `output_index` order.
+fn aggregate_responses(chunks: &[Chunk]) -> (Json, bool) {
+    let mut base = Json::Null;
+    let mut terminal = None;
+    let mut done: Vec<(Option<u64>, usize, Json)> = vec![];
+    let mut pending: Vec<(Option<u64>, usize, Json)> = vec![];
+    let mut arrival = 0;
+    let index_of = |data: &Json| data.get("output_index").and_then(Json::as_u64);
+    let matches = |entry: &(Option<u64>, usize, Json), data: &Json| {
+        let id = data
+            .get("item_id")
+            .or_else(|| data.pointer("/item/id"))
+            .and_then(Json::as_str);
+        match (id, entry.2.get("id").and_then(Json::as_str)) {
+            (Some(a), Some(b)) => a == b,
+            _ => index_of(data).is_some() && entry.0 == index_of(data),
+        }
+    };
+    for chunk in chunks {
+        let data = &chunk.data;
+        let response = data.get("response").filter(|r| r.is_object());
+        match data.get("type").and_then(Json::as_str) {
+            Some("response.created" | "response.in_progress") if terminal.is_none() => {
+                if let Some(response) = response {
+                    base = response.clone();
+                }
+            }
+            Some(kind @ ("response.completed" | "response.incomplete" | "response.failed")) => {
+                if let Some(response) = response {
+                    base = response.clone();
+                }
+                terminal = Some(kind);
+            }
+            Some("response.output_item.added")
+                if data.pointer("/item/type").and_then(Json::as_str) == Some("function_call") =>
+            {
+                pending.push((index_of(data), arrival, data["item"].clone()));
+                arrival += 1;
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let (Some(entry), Some(delta)) = (
+                    pending.iter_mut().find(|entry| matches(entry, data)),
+                    data.get("delta").and_then(Json::as_str),
+                ) {
+                    let mut text = entry.2["arguments"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    text.push_str(delta);
+                    entry.2["arguments"] = json!(text);
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = data.get("item") {
+                    let announced = pending
+                        .iter()
+                        .position(|entry| matches(entry, data))
+                        .map(|i| pending.remove(i).1);
+                    done.push((index_of(data), announced.unwrap_or(arrival), item.clone()));
+                    arrival += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Consumers settle announced but unfinished calls only after a completed response.
+    if terminal == Some("response.completed") {
+        done.extend(pending);
+    }
+    if !done.is_empty() && base.is_object() {
+        if done.iter().all(|entry| entry.0.is_some()) {
+            done.sort_by_key(|entry| entry.0);
+        } else {
+            done.sort_by_key(|entry| entry.1);
+        }
+        base["output"] = json!(done.into_iter().map(|entry| entry.2).collect::<Vec<_>>());
+    }
+    let ok =
+        matches!(terminal, Some("response.completed" | "response.incomplete")) && base.is_object();
+    (base, ok)
+}
+
+fn merge_chat_delta(
+    index: u64,
+    delta: &serde_json::Map<String, Json>,
+    message: &mut Json,
+    tools: &mut BTreeMap<(u64, u64), Json>,
+) {
+    for (key, value) in delta {
+        if key == "tool_calls" {
+            merge_tool_deltas(index, value, tools);
+        } else if key == "role" {
+            if message.get(key).is_none() {
+                message[key] = value.clone();
+            }
+        } else if value.is_null() && message.get(key).is_some() {
+            // A later null delta never erases accumulated text.
+        } else if let Some(text) = value.as_str() {
+            let mut accumulated = message[key].as_str().unwrap_or_default().to_string();
+            accumulated.push_str(text);
+            message[key] = json!(accumulated);
+        } else {
+            message[key] = value.clone();
+        }
+    }
 }
 
 fn merge_tool_deltas(index: u64, value: &Json, tools: &mut BTreeMap<(u64, u64), Json>) {

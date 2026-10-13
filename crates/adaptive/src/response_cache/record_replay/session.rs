@@ -102,7 +102,9 @@ pub struct Run {
     pub key: KeyedRequest,
     pub repeat: Option<u64>,
     pub entry: Option<Call>,
-    pub _guard: ModelGuard,
+    /// Released when the model call stops being in flight, which can
+    /// precede the consumer receipt that finalizes the call line.
+    pub guard: Option<ModelGuard>,
     pub t0: Instant,
     pub cpu_start: cpu::CpuSnapshot,
     pub gate_wait_ms: u64,
@@ -245,7 +247,9 @@ impl Session {
             .is_err())
             && reason.as_deref() != Some("config_invalid")
         {
-            lock(&session.state.data).fail = Some("output_directory_unwritable".into());
+            lock(&session.state.data)
+                .fail
+                .get_or_insert_with(|| "output_directory_unwritable".into());
         }
         session
     }
@@ -336,7 +340,11 @@ impl Session {
             let mut data = lock(&self.state.data);
             if data.busy {
                 drop(data);
-                self.divergence(0, "RR-CONCURRENT", None, None, Json::Null);
+                // The rejected call consumes no seq, so its line carries none.
+                self.output(
+                    "divergence",
+                    json!({"seq":null,"type":"RR-CONCURRENT","key_hash":null,"repeat_index":null,"detail":null}),
+                );
                 return Err(error("RR-CONCURRENT"));
             }
             data.busy = true;
@@ -349,39 +357,6 @@ impl Session {
                 },
             )
         };
-        if self.config.mode != "record" {
-            let missing = {
-                let mut data = lock(&self.state.data);
-                let missing: Vec<_> = self
-                    .state
-                    .reader
-                    .as_ref()
-                    .into_iter()
-                    .flat_map(|reader| reader.tools.iter())
-                    .filter(|(key, line)| {
-                        !data.executed.contains(*key)
-                            && data.last.as_ref().is_some_and(|parent| {
-                                line["parent_key_hash"] == json!(parent.hash)
-                                    && line["parent_repeat_index"] == json!(parent.repeat)
-                            })
-                    })
-                    .map(|(key, line)| (key.clone(), line.clone()))
-                    .collect();
-                if !missing.is_empty() && self.config.mode == "verify" {
-                    data.verify_failed = true;
-                }
-                missing
-            };
-            for (key, line) in missing {
-                self.divergence(
-                    seq,
-                    "tool_unmatched",
-                    line["parent_key_hash"].as_str(),
-                    line["parent_repeat_index"].as_u64(),
-                    json!({"missing_recorded_tool":key}),
-                );
-            }
-        }
         let key = self.state.builder.build(operation, request, &self.cache);
         let (repeat, fail, verify_failed, gate_failed) = {
             let mut data = lock(&self.state.data);
@@ -467,7 +442,7 @@ impl Session {
             key,
             repeat,
             entry,
-            _guard: guard,
+            guard: Some(guard),
             t0,
             cpu_start,
             gate_wait_ms,
@@ -538,7 +513,12 @@ impl Session {
                         break;
                     }
                     Err(_) => {
-                        lock(&self.state.data).fail = Some("config_invalid".into());
+                        lock(&self.state.data)
+                            .fail
+                            .get_or_insert_with(|| "config_invalid".into());
+                        armed["gate_outcome"] = json!("unreadable");
+                        armed["gate_wait_ms"] = json!(start.elapsed().as_millis() as u64);
+                        let _ = trace::atomic_json(&path, &armed);
                         self.divergence(
                             seq,
                             "RR-UNAVAILABLE",
@@ -589,7 +569,9 @@ impl Session {
         armed["gate_wait_ms"] = json!(wait);
         armed["cpu_at_release"] = json!(cpu::snapshot());
         if trace::atomic_json(&path, &armed).is_err() {
-            lock(&self.state.data).fail = Some("output_directory_unwritable".into());
+            lock(&self.state.data)
+                .fail
+                .get_or_insert_with(|| "output_directory_unwritable".into());
             return Err(error("RR-UNAVAILABLE"));
         }
         Ok((wait, self.config.start_gate.as_ref().map(|_| release)))

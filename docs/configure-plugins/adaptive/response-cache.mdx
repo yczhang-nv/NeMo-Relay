@@ -83,7 +83,6 @@ precedence rules, refer to
 
 ## Plugin Configuration
 
-
 Use plugin configuration when the application should let NeMo Relay own the
 cache lifecycle.
 
@@ -650,18 +649,34 @@ corrupt records, or an exhausted answer fails closed.
 
 Repeated requests consume their recorded answers in FIFO order. Original Chat
 Completions and Responses stream chunks retain reasoning, usage and provider
-extension fields; buffered replay uses the recorded aggregate. Timing output
-reports delivery lateness separately from the recorded schedule. A stream
-abandoned by its caller is incomplete, even if the Python producer prefetched it.
-Items known to be available before the consumer poll carry `hermes_paced: true`.
-Other items carry `null`: bridge timing cannot establish when socket data arrived.
+extension fields. Buffered replay uses the recorded aggregate: for Responses
+streams, the terminal response with its `output` rebuilt from the
+`response.output_item.done` items. A `response.incomplete` terminal, such as a
+maximum-output-token stop, is a complete answer; `response.failed`, an `error`
+event, or a stream without a terminal response is a stream error.
+
+Timing output reports when the paced stream released each chunk and its end,
+and the lateness against the recorded schedule. A call counts as complete only
+when its caller consumed the entire answer, even if the Python bridge prefetched
+it. A call stops being in flight when its stream ends, so a caller that holds a
+finished stream does not block the next call.
+
+Each recorded chunk and stream end carries a `hermes_paced` marker. The name
+comes from the benchmark harness, but the marker applies to any caller of the
+Python bridge. It is `true` when the item was available before the caller asked
+for it, so the recorded offset reflects the caller's pace, and `false` when the
+caller was already waiting. It is `null` when no consumer clock was attached.
+Availability is measured at the bridge, not at socket arrival.
+
 Record/replay currently requires Unix. Other platforms report a validation warning
 and install fail-closed intercepts; ordinary response caching remains available.
 
 Only the adaptive response-cache section may be enabled in this mode. Do not
-configure tool caching, cache bypass, header allowlists, a Redis backend, or a
-custom intercept priority. Malformed record/replay fields produce warning
-diagnostics while error-returning intercepts stay active. Validation errors
+configure tool caching, cache bypass, header allowlists, a Redis backend, a
+non-default policy, or a custom intercept priority. Malformed record/replay
+fields and forbidden settings produce warning diagnostics while error-returning
+model intercepts stay active. Tools always run live: in the fail-closed state
+they run unrecorded and uncompared. Validation errors
 outside that section retain their ordinary behavior, so callers must run plugin
 validation before execution and refuse problematic configurations.
 
@@ -692,5 +707,8 @@ component = ComponentSpec(AdaptiveConfig(
 ))
 ```
 
-The normal managed LLM and tool APIs remain the execution surface; no harness
-code changes are required. Every agent needs its own writable output directory.
+The normal managed LLM and tool APIs remain the execution surface. A harness
+needs no record/replay-specific code, but it must consume each replayed stream
+through its terminal item and accept chunks delivered as JSON objects, because
+replay opens no provider stream. Every agent needs its own writable output
+directory.

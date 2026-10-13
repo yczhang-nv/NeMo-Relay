@@ -94,6 +94,10 @@ impl Writer {
         nonce: &str,
         id: &str,
     ) -> Result<Self, &'static str> {
+        // Another process's live or unfinalized recording owns the folder.
+        if dir.join("record.lock").exists() {
+            return Err("trace_locked");
+        }
         for name in ["trace.json", "calls.jsonl", "requests.jsonl", "tools.jsonl"] {
             if dir.join(name).exists() {
                 return Err("trace_directory_not_empty");

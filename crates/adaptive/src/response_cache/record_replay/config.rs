@@ -265,7 +265,7 @@ pub fn parse_record_replay(value: &Json) -> RecordReplayParse {
             let value = p.string(map, key, &format!("record_replay.{key}"), true, "");
             if map.get(key).is_some_and(Json::is_string) && value.trim().is_empty() {
                 p.error(
-                    "invalid_type",
+                    "missing_field",
                     &format!("record_replay.{key}"),
                     "expected a non-empty path",
                 );
@@ -309,17 +309,22 @@ fn parse_gate(
     {
         let path = p.string(gate, "path", "record_replay.start_gate.path", true, "");
         let timeout = match gate.get("timeout_seconds") {
-            None => 3600,
-            Some(value) => value.as_u64().unwrap_or_else(|| {
-                p.error(
-                    "invalid_type",
-                    "record_replay.start_gate.timeout_seconds",
-                    "expected a positive integer",
-                );
-                0
-            }),
+            None => Some(3600),
+            Some(value) => {
+                let timeout = value.as_u64();
+                if timeout.is_none() {
+                    p.error(
+                        "invalid_type",
+                        "record_replay.start_gate.timeout_seconds",
+                        "expected a positive integer",
+                    );
+                }
+                timeout
+            }
         };
-        if path.trim().is_empty() || !(1..=604800).contains(&timeout) {
+        // A missing path or a mistyped timeout already has its own code.
+        let empty_path = gate.get("path").is_some_and(Json::is_string) && path.trim().is_empty();
+        if empty_path || timeout.is_some_and(|t| !(1..=604800).contains(&t)) {
             p.error(
                 "invalid_gate",
                 "record_replay.start_gate",
@@ -328,7 +333,7 @@ fn parse_gate(
         }
         config.start_gate = Some(StartGateConfig {
             path: path.into(),
-            timeout_seconds: timeout,
+            timeout_seconds: timeout.unwrap_or_default(),
         });
     }
 }
@@ -386,12 +391,24 @@ fn parse_filters(
                 for (i, value) in blocks.iter().enumerate() {
                     let field = format!("record_replay.key_filters.redact_blocks[{i}]");
                     if let Some(block) = p.table(value, &field, &["start", "end"]) {
+                        let mut mistyped = false;
+                        for key in ["start", "end"] {
+                            if block.get(key).is_some_and(|v| !v.is_string()) {
+                                mistyped = true;
+                                p.error(
+                                    "invalid_type",
+                                    &format!("{field}.{key}"),
+                                    "expected a string literal",
+                                );
+                            }
+                        }
                         let start = block
                             .get("start")
                             .and_then(Json::as_str)
                             .unwrap_or_default();
                         let end = block.get("end").and_then(Json::as_str).unwrap_or_default();
-                        if start.is_empty() || end.is_empty() {
+                        if mistyped {
+                        } else if start.is_empty() || end.is_empty() {
                             p.error(
                                 "key_filters_invalid_block",
                                 &field,
@@ -441,11 +458,11 @@ fn parse_divergence(
             vec![],
         );
         let mut seen = HashSet::new();
-        for name in &config.divergence.tool_names {
+        for (i, name) in config.divergence.tool_names.iter().enumerate() {
             if name.is_empty() || !seen.insert(name) {
                 p.error(
                     "invalid_divergence",
-                    "record_replay.divergence.tool_names",
+                    &format!("record_replay.divergence.tool_names[{i}]"),
                     "tool names must be non-empty and unique",
                 );
             }
@@ -577,6 +594,67 @@ mod tests {
         let parsed = parse_record_replay(&json!({"output_directory":"/tmp/out"}));
         assert_eq!(parsed.output_directory, Some(PathBuf::from("/tmp/out")));
         assert_eq!(parsed.diagnostics.len(), 2);
+    }
+    #[test]
+    fn each_problem_reports_its_table_code_once() {
+        let base = json!({"mode":"replay","trace_directory":"/t","output_directory":"/o"});
+        let cases = [
+            (
+                json!({"trace_directory":""}),
+                "missing_field",
+                "record_replay.trace_directory",
+            ),
+            (
+                json!({"start_gate":{}}),
+                "missing_field",
+                "record_replay.start_gate.path",
+            ),
+            (
+                json!({"start_gate":{"path":"/g","timeout_seconds":1.5}}),
+                "invalid_type",
+                "record_replay.start_gate.timeout_seconds",
+            ),
+            (
+                json!({"start_gate":{"path":""}}),
+                "invalid_gate",
+                "record_replay.start_gate",
+            ),
+            (
+                json!({"key_filters":{"redact_blocks":[{"start":5,"end":"e"}]}}),
+                "invalid_type",
+                "record_replay.key_filters.redact_blocks[0].start",
+            ),
+            (
+                json!({"key_filters":{"redact_blocks":[{"start":"","end":"e"}]}}),
+                "key_filters_invalid_block",
+                "record_replay.key_filters.redact_blocks[0]",
+            ),
+            (
+                json!({"divergence":{"tool_names":["a","a"]}}),
+                "invalid_divergence",
+                "record_replay.divergence.tool_names[1]",
+            ),
+        ];
+        for (overlay, code, field) in cases {
+            let mut value = base.clone();
+            for (key, item) in overlay.as_object().unwrap() {
+                value[key] = item.clone();
+            }
+            let parsed = parse_record_replay(&value);
+            let found: Vec<_> = parsed
+                .diagnostics
+                .iter()
+                .map(|d| (d.code.clone(), d.field.clone()))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    format!("response_cache.record_replay_{code}"),
+                    Some(field.to_string())
+                )],
+                "{overlay}"
+            );
+        }
     }
     #[test]
     fn defaults_and_integer_scale_parse() {

@@ -449,3 +449,29 @@ async fn adaptive_plugin_registers_runtime_and_rolls_back_registration() {
     assert_eq!(registrations.len(), 1);
     rollback_registrations(&mut registrations);
 }
+
+#[test]
+fn record_replay_component_policy_never_escalates_to_errors() {
+    let config = json!({
+        "version": 1,
+        "policy": {"unknown_field": "error", "unsupported_value": "error"},
+        "response_cache": {
+            "namespace": "rr",
+            "namspace_typo": true,
+            "record_replay": {"mode": "replay", "trace_directory": "/t", "output_directory": "/o"}
+        }
+    });
+
+    let diagnostics = validate_adaptive_plugin_config(config.as_object().unwrap());
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.level == DiagnosticLevel::Warning),
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "response_cache.record_replay_forbidden_policy")
+    );
+}

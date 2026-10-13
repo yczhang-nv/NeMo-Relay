@@ -240,7 +240,9 @@ fn validate_adaptive_plugin_config_with_policy(
                 "record/replay owns the innermost intercept priority",
             ));
         }
-        validate_response_cache_section(&mut diagnostics, &config.policy, plugin_config);
+        // A non-default component policy is itself a forbidden_policy Warning, so it
+        // must not escalate response-cache unknown fields into activation Errors.
+        validate_response_cache_section(&mut diagnostics, &ConfigPolicy::default(), plugin_config);
         return diagnostics;
     }
     if let Some(policy) = policy {

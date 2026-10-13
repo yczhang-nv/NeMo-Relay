@@ -3,7 +3,7 @@
 
 use super::{
     cpu,
-    session::{Session, State, error, lock},
+    session::{Session, State, lock},
     trace::tool_key,
 };
 use crate::response_cache::key::fingerprint;
@@ -30,13 +30,25 @@ pub fn make_tool(session: Arc<Session>) -> ToolExecutionFn {
             let name = context.tool_name().to_string();
             let args = context.args().clone();
             let id = context.tool_call_id().map(str::to_string);
+            let failed = {
+                let mut data = lock(&session.state.data);
+                data.tool_calls += 1;
+                data.fail.is_some()
+            };
+            if failed {
+                // Tools always run live; fail-closed only refuses model
+                // calls, so the tool runs unrecorded and uncompared.
+                return next(args)
+                    .await
+                    .map(|result| ToolExecutionInterceptOutcome {
+                        result: result.result,
+                        annotation: result.annotation,
+                        pending_marks: vec![],
+                    });
+            }
             let (token, parent, ordinal) = {
                 let mut data = lock(&session.state.data);
-                if data.fail.is_some() {
-                    return Err(error("RR-UNAVAILABLE"));
-                }
-                let token = data.tool_calls;
-                data.tool_calls += 1;
+                let token = data.tool_calls - 1;
                 let overlap = !data.tools_active.is_empty();
                 if overlap {
                     for value in data.tools_active.values_mut() {
@@ -66,6 +78,9 @@ pub fn make_tool(session: Arc<Session>) -> ToolExecutionFn {
             let t0 = Instant::now();
             let result = next(args.clone()).await;
             let wall_us = t0.elapsed().as_micros() as u64;
+            // Snapshot before Relay's own result inspection, so the delta covers
+            // only the work across `next()`.
+            let end = start.as_ref().map(|_| cpu::snapshot());
             let overlap = lock(&session.state.data)
                 .tools_active
                 .remove(&token)
@@ -136,8 +151,8 @@ pub fn make_tool(session: Arc<Session>) -> ToolExecutionFn {
                 "match":if id.is_some(){"id"}else{"fallback"},"args_sha256":fingerprint(&args),
                 "result_kind":kind,"shape_ok":shape,"fields":fields,"output_bytes":bytes,"wall_us":wall_us,"overlapped":overlap,
                 "call_tool_cpu_us":null,"call_harness_cpu_us":null,"cpu_source":null});
-            if let Some(start) = start {
-                let (harness, tool, source) = cpu::delta(&start, &cpu::snapshot());
+            if let (Some(start), Some(end)) = (start, end) {
+                let (harness, tool, source) = cpu::delta(&start, &end);
                 line["call_harness_cpu_us"] = json!(harness);
                 line["call_tool_cpu_us"] = json!(tool);
                 line["cpu_source"] = json!(source);
