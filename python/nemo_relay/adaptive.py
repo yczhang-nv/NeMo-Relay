@@ -377,6 +377,66 @@ class ToolCacheConfig:
 
 
 @dataclass(slots=True)
+class StartGateConfig:
+    """First-model-call gate; timeout starts when the agent becomes ready."""
+
+    path: str
+    timeout_seconds: int = 3600
+
+
+@dataclass(slots=True)
+class RedactBlock:
+    """Inclusive, repeated literal block replaced before trace request keying."""
+
+    start: str
+    end: str
+
+
+@dataclass(slots=True)
+class KeyFiltersConfig:
+    """Volatile-field filters; tool-result placeholders retain call IDs and order."""
+
+    drop: list[str] = field(default_factory=list)
+    redact_lines: list[str] = field(default_factory=list)
+    redact_blocks: list[RedactBlock] = field(default_factory=list)
+    tool_results: Literal["keep", "placeholder"] = "keep"
+
+
+@dataclass(slots=True)
+class DivergenceConfig:
+    """Live-tool outcome checks; tool results are never replaced by stored output."""
+
+    tool_names: list[str] = field(default_factory=list)
+    tool_fields: list[str] = field(default_factory=lambda: ["/exit_code", "/error"])
+    flag_fields: list[str] = field(default_factory=lambda: ["/error"])
+    output_size_tolerance: float = 0.5
+    measure_tool_cpu_time: bool = False
+
+
+@dataclass(slots=True)
+class RecordReplayConfig:
+    """Dedicated lossless recording or fail-closed verification/replay.
+
+    Replay never calls the provider. Each recorded chunk and stream end follows
+    its original schedule multiplied by ``latency_scale``; zero disables waits.
+    The trace directory must exist, and each agent needs its own output directory.
+    Core validation reports malformed settings without silently disabling interception.
+    """
+
+    mode: Literal["record", "verify", "replay"]
+    trace_directory: str
+    output_directory: str
+    latency_scale: float = 1.0
+    start_gate: StartGateConfig | None = None
+    key_filters: KeyFiltersConfig | None = None
+    divergence: DivergenceConfig | None = None
+
+    def to_dict(self) -> JsonObject:
+        """Serialize only configured optional sections for native validation."""
+        return _normalize_object({item.name: getattr(self, item.name) for item in fields(self)})
+
+
+@dataclass(slots=True)
 class ResponseCacheConfig:
     """Opt-in LLM response and tool-result cache settings.
 
@@ -398,6 +458,7 @@ class ResponseCacheConfig:
         header_allowlist: Request headers folded into the key; never auth headers.
         backend: Cache storage backend (``in_memory`` or ``redis``).
         tools: Opt-in tool-result cache; ``None`` leaves it off.
+        record_replay: Dedicated trace mode; ``None`` preserves ordinary caching.
     """
 
     ttl_seconds: int = 3600
@@ -409,10 +470,11 @@ class ResponseCacheConfig:
     header_allowlist: list[str] = field(default_factory=list)
     backend: BackendSpec = field(default_factory=BackendSpec.in_memory)
     tools: ToolCacheConfig | None = None
+    record_replay: RecordReplayConfig | None = None
 
     def to_dict(self) -> JsonObject:
         """Serialize this response-cache config to the canonical JSON object shape."""
-        return _normalize_object(
+        result = _normalize_object(
             {
                 "ttl_seconds": self.ttl_seconds,
                 "namespace": self.namespace,
@@ -427,8 +489,12 @@ class ResponseCacheConfig:
                 "header_allowlist": self.header_allowlist,
                 "backend": _normalize(self.backend),
                 "tools": _normalize(self.tools),
+                "record_replay": _normalize(self.record_replay),
             }
         )
+        if self.record_replay is not None and self.priority == 50:
+            result.pop("priority", None)
+        return result
 
 
 @dataclass(slots=True)

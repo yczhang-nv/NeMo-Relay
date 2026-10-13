@@ -1274,6 +1274,7 @@ impl PyLlmStreamNextFn {
                     receiver: Arc::new(tokio::sync::Mutex::new(rx)),
                     cancel,
                     closed: closed_rx,
+                    consumer_clock: None,
                 })
             }),
         )

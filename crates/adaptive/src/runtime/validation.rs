@@ -26,68 +26,126 @@ pub fn validate_config(config: &AdaptiveConfig) -> ConfigReport {
         );
     }
 
-    if let Some(state) = &config.state {
-        validate_backend(&mut report, &config.policy, &state.backend);
-    }
-
-    if config.telemetry.is_some() && config.state.is_none() {
-        report.diagnostics.push(ConfigDiagnostic {
-            level: DiagnosticLevel::Warning,
-            code: "adaptive.section_disabled_missing_state".to_string(),
-            component: Some("telemetry".to_string()),
-            field: None,
-            message: "telemetry requires state backend and will be disabled".to_string(),
-        });
-    }
-
-    if config.acg.is_some() && config.state.is_none() {
-        report.diagnostics.push(ConfigDiagnostic {
-            level: DiagnosticLevel::Warning,
-            code: "adaptive.section_disabled_missing_state".to_string(),
-            component: Some("acg".to_string()),
-            field: None,
-            message: "acg requires state backend and will be disabled".to_string(),
-        });
-    }
-
-    if let Some(tool_parallelism) = &config.tool_parallelism
-        && tool_parallelism.mode != "observe_only"
-        && tool_parallelism.mode != "inject_hints"
-        && tool_parallelism.mode != "schedule"
+    if config
+        .response_cache
+        .as_ref()
+        .is_none_or(|c| c.record_replay.is_none())
     {
-        push_policy_diag(
-            &mut report.diagnostics,
-            config.policy.unsupported_value,
-            "adaptive.unsupported_value",
-            Some("tool_parallelism".to_string()),
-            Some("mode".to_string()),
-            format!(
-                "tool_parallelism mode '{}' is unsupported; expected observe_only, inject_hints, or schedule",
-                tool_parallelism.mode
-            ),
-        );
-    }
+        if let Some(state) = &config.state {
+            validate_backend(&mut report, &config.policy, &state.backend);
+        }
 
-    if let Some(acg) = &config.acg
-        && acg.provider != "anthropic"
-        && acg.provider != "openai"
-        && acg.provider != "passthrough"
-    {
-        push_policy_diag(
-            &mut report.diagnostics,
-            config.policy.unsupported_value,
-            "adaptive.unsupported_value",
-            Some("acg".to_string()),
-            Some("provider".to_string()),
-            format!(
-                "acg provider '{}' is unsupported; expected anthropic, openai, or passthrough",
-                acg.provider
-            ),
-        );
-    }
+        if config.telemetry.is_some() && config.state.is_none() {
+            report.diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                code: "adaptive.section_disabled_missing_state".to_string(),
+                component: Some("telemetry".to_string()),
+                field: None,
+                message: "telemetry requires state backend and will be disabled".to_string(),
+            });
+        }
 
+        if config.acg.is_some() && config.state.is_none() {
+            report.diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                code: "adaptive.section_disabled_missing_state".to_string(),
+                component: Some("acg".to_string()),
+                field: None,
+                message: "acg requires state backend and will be disabled".to_string(),
+            });
+        }
+
+        if let Some(tool_parallelism) = &config.tool_parallelism
+            && tool_parallelism.mode != "observe_only"
+            && tool_parallelism.mode != "inject_hints"
+            && tool_parallelism.mode != "schedule"
+        {
+            push_policy_diag(
+                &mut report.diagnostics,
+                config.policy.unsupported_value,
+                "adaptive.unsupported_value",
+                Some("tool_parallelism".to_string()),
+                Some("mode".to_string()),
+                format!(
+                    "tool_parallelism mode '{}' is unsupported; expected observe_only, inject_hints, or schedule",
+                    tool_parallelism.mode
+                ),
+            );
+        }
+
+        if let Some(acg) = &config.acg
+            && acg.provider != "anthropic"
+            && acg.provider != "openai"
+            && acg.provider != "passthrough"
+        {
+            push_policy_diag(
+                &mut report.diagnostics,
+                config.policy.unsupported_value,
+                "adaptive.unsupported_value",
+                Some("acg".to_string()),
+                Some("provider".to_string()),
+                format!(
+                    "acg provider '{}' is unsupported; expected anthropic, openai, or passthrough",
+                    acg.provider
+                ),
+            );
+        }
+    }
     if let Some(response_cache) = &config.response_cache {
         validate_response_cache(&mut report, response_cache);
+        if let Some(raw) = &response_cache.record_replay {
+            use crate::response_cache::record_replay::config::{diagnostic, parse_record_replay};
+            if !cfg!(unix) {
+                report.diagnostics.push(diagnostic(
+                    "platform_unsupported",
+                    "record_replay",
+                    "record/replay currently requires a Unix platform",
+                ));
+            }
+            report
+                .diagnostics
+                .extend(parse_record_replay(raw).diagnostics);
+            for (field, present) in [
+                ("state", config.state.is_some()),
+                ("telemetry", config.telemetry.is_some()),
+                ("acg", config.acg.is_some()),
+                ("adaptive_hints", config.adaptive_hints.is_some()),
+                ("tool_parallelism", config.tool_parallelism.is_some()),
+            ] {
+                if present {
+                    report.diagnostics.push(diagnostic(
+                        "forbidden_section",
+                        field,
+                        "record/replay cannot be combined with this adaptive section",
+                    ));
+                }
+            }
+            if config.policy != ConfigPolicy::default() {
+                report.diagnostics.push(diagnostic(
+                    "forbidden_policy",
+                    "policy",
+                    "record/replay requires the default diagnostic policy",
+                ));
+            }
+            for (field, forbidden) in [
+                ("tools", response_cache.tools.is_some()),
+                ("bypass_rate", response_cache.bypass_rate != 0.0),
+                (
+                    "header_allowlist",
+                    !response_cache.header_allowlist.is_empty(),
+                ),
+                ("backend", response_cache.backend.kind != "in_memory"),
+                ("priority", response_cache.priority != 50),
+            ] {
+                if forbidden {
+                    report.diagnostics.push(diagnostic(
+                        "forbidden_cache_setting",
+                        &format!("response_cache.{field}"),
+                        "cache setting is incompatible with record/replay",
+                    ));
+                }
+            }
+        }
     }
 
     report
@@ -116,7 +174,7 @@ fn validate_response_cache(report: &mut ConfigReport, config: &ResponseCacheConf
             "ttl_seconds must be greater than 0".to_string(),
         ));
     }
-    if !(0.0..=1.0).contains(&config.bypass_rate) {
+    if config.record_replay.is_none() && !(0.0..=1.0).contains(&config.bypass_rate) {
         report.diagnostics.push(response_cache_error(
             "response_cache.invalid_bypass_rate",
             Some("bypass_rate"),
@@ -132,6 +190,9 @@ fn validate_response_cache(report: &mut ConfigReport, config: &ResponseCacheConf
                 config.key_strategy.as_str()
             ),
         ));
+    }
+    if config.record_replay.is_some() {
+        return;
     }
     // Auth material must never enter the key or the stored entries.
     const AUTH_HEADERS: &[&str] = &[

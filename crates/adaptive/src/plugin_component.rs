@@ -42,11 +42,19 @@ impl ComponentSpec {
 
 impl From<ComponentSpec> for PluginComponentSpec {
     fn from(value: ComponentSpec) -> Self {
-        let Json::Object(config) =
+        let Json::Object(mut config) =
             serde_json::to_value(value.config).expect("adaptive config should serialize to object")
         else {
             unreachable!("adaptive config must serialize to object");
         };
+        if let Some(cache) = config
+            .get_mut("response_cache")
+            .and_then(Json::as_object_mut)
+            && cache.contains_key("record_replay")
+            && cache.get("priority") == Some(&Json::from(50))
+        {
+            cache.remove("priority");
+        }
 
         PluginComponentSpec {
             kind: ADAPTIVE_PLUGIN_KIND.to_string(),
@@ -182,6 +190,59 @@ fn validate_adaptive_plugin_config_with_policy(
             }];
         }
     };
+    if config
+        .response_cache
+        .as_ref()
+        .is_some_and(|c| c.record_replay.is_some())
+    {
+        use crate::response_cache::record_replay::config::diagnostic;
+        let mut diagnostics = AdaptiveRuntime::validate_config(&config).diagnostics;
+        for key in plugin_config.keys() {
+            if ![
+                "version",
+                "agent_id",
+                "policy",
+                "response_cache",
+                "state",
+                "telemetry",
+                "acg",
+                "adaptive_hints",
+                "tool_parallelism",
+            ]
+            .contains(&key.as_str())
+            {
+                diagnostics.push(diagnostic(
+                    "forbidden_section",
+                    key,
+                    "record/replay does not allow this adaptive section",
+                ));
+            }
+        }
+        if policy.is_some_and(|p| p != &ConfigPolicy::default()) {
+            diagnostics.push(diagnostic(
+                "forbidden_policy",
+                "policy",
+                "record/replay requires the default global policy",
+            ));
+        }
+        if plugin_config
+            .get("response_cache")
+            .and_then(|c| c.get("priority"))
+            .is_some()
+            && config
+                .response_cache
+                .as_ref()
+                .is_some_and(|c| c.priority == 50)
+        {
+            diagnostics.push(diagnostic(
+                "forbidden_cache_setting",
+                "response_cache.priority",
+                "record/replay owns the innermost intercept priority",
+            ));
+        }
+        validate_response_cache_section(&mut diagnostics, &config.policy, plugin_config);
+        return diagnostics;
+    }
     if let Some(policy) = policy {
         config.policy = apply_global_config_policy(config.policy, policy);
     }
@@ -339,6 +400,7 @@ fn validate_response_cache_section(
             "header_allowlist",
             "backend",
             "tools",
+            "record_replay",
         ],
     );
     if let Some(backend_json) = response_cache_json.get("backend").and_then(Json::as_object) {

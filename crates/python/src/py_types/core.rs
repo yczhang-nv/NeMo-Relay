@@ -157,6 +157,8 @@ pub struct PyLlmStream {
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<FlowResult<serde_json::Value>>>>,
     pub cancel: tokio::sync::watch::Sender<bool>,
     pub closed: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+    pub consumer_clock:
+        Option<nemo_relay::api::runtime::stream_consumer_clock::StreamConsumerClock>,
 }
 
 #[pymethods]
@@ -166,16 +168,33 @@ impl PyLlmStream {
     }
 
     pub(crate) fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(clock) = &self.consumer_clock {
+            clock.requested();
+        }
         let receiver = Arc::clone(&self.receiver);
+        let consumer_clock = self.consumer_clock.clone();
 
         crate::py_async::future_into_py(py, async move {
             let mut guard = receiver.lock().await;
             let next_item = guard.recv().await;
             match next_item {
-                None => Err(PyErr::new::<pyo3::exceptions::PyStopAsyncIteration, _>(
-                    "stream exhausted",
-                )),
-                Some(Ok(value)) => Python::attach(|py| json_to_py(py, &value)),
+                None => {
+                    if let Some(clock) = consumer_clock {
+                        clock.finish(true);
+                    }
+                    Err(PyErr::new::<pyo3::exceptions::PyStopAsyncIteration, _>(
+                        "stream exhausted",
+                    ))
+                }
+                Some(Ok(value)) => {
+                    let result = Python::attach(|py| json_to_py(py, &value));
+                    if result.is_ok()
+                        && let Some(clock) = consumer_clock
+                    {
+                        clock.delivered();
+                    }
+                    result
+                }
                 Some(Err(e)) => Err(flow_error_to_py_err(e)),
             }
         })
@@ -185,6 +204,9 @@ impl PyLlmStream {
     ///
     /// This operation is idempotent and raises when producer cleanup fails.
     fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(clock) = &self.consumer_clock {
+            clock.finish(false);
+        }
         let cancel = self.cancel.clone();
         let mut closed = self.closed.clone();
         let receiver = Arc::clone(&self.receiver);
@@ -209,6 +231,9 @@ impl PyLlmStream {
 
 impl Drop for PyLlmStream {
     fn drop(&mut self) {
+        if let Some(clock) = &self.consumer_clock {
+            clock.finish(false);
+        }
         self.cancel.send_replace(true);
     }
 }

@@ -221,6 +221,20 @@ pub struct ResponseCacheConfig {
     /// Opt-in tool-result cache configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolCacheConfig>,
+    /// Dedicated trace recording/replay. Kept raw so invalid values can install
+    /// fail-closed middleware instead of refusing plugin activation.
+    #[serde(
+        default,
+        deserialize_with = "present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub record_replay: Option<Json>,
+}
+
+fn present_json<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Json>, D::Error> {
+    Json::deserialize(deserializer).map(Some)
 }
 
 impl Default for ResponseCacheConfig {
@@ -235,6 +249,7 @@ impl Default for ResponseCacheConfig {
             header_allowlist: Vec::new(),
             backend: BackendConfig::default(),
             tools: None,
+            record_replay: None,
         }
     }
 }
@@ -510,6 +525,9 @@ nemo_relay::editor_config! {
             nested: ToolCacheConfig,
             default: ToolCacheConfig,
         },
+        record_replay => { label: "record_replay", kind: Section, optional: true,
+            nested: crate::response_cache::record_replay::config::RecordReplayConfig,
+            default: crate::response_cache::record_replay::config::RecordReplayConfig },
     }
 }
 

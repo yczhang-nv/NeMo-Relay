@@ -1868,6 +1868,7 @@ name = "nemo-relay-adaptive"
 version = "0.10.0"
 dependencies = [
  "chrono",
+ "libc",
  "log",
  "nemo-relay",
  "redis",

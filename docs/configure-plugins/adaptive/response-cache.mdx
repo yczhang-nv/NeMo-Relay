@@ -24,6 +24,11 @@ set `cache_nondeterministic = true` to opt sampled requests into caching.
 Runtime backend errors fail open to a normal live call, while invalid
 configuration is rejected during validation.
 
+The optional `record_replay` mode uses a separate trace store and different
+failure behavior. Verification and replay never invoke the managed model
+provider, including when a request cannot be matched. See
+[Record and Replay](#record-and-replay) below.
+
 `namespace` is required and defines one trusted cache-sharing domain. Do not
 use one namespace across mutually untrusted tenants or upstreams.
 `header_allowlist` does not replace this trust boundary.
@@ -77,6 +82,7 @@ precedence rules, refer to
 [Plugin Configuration Files](/configure-plugins/plugin-configuration-files).
 
 ## Plugin Configuration
+
 
 Use plugin configuration when the application should let NeMo Relay own the
 cache lifecycle.
@@ -595,3 +601,96 @@ Tool-cache diagnostics use the following error codes.
 | `response_cache.tool_catch_all_override` | A cacheable `*` override applies to every tool. |
 | `response_cache.tool_conflicting_classes` | Overlapping wildcard members in different classes have different `cacheable` values. |
 | `response_cache.tool_conflicting_overrides` | Overlapping wildcard overrides have different `cacheable` declarations. An omitted value inherits policy, so it cannot safely overlap an explicit value. |
+
+## Record and Replay
+
+Use `response_cache.record_replay` to record managed model responses once, then
+serve their original chunks on their recorded schedule while every tool runs
+live. This mode is separate from ordinary caching: it has no TTL, cache bypass,
+tool-result substitution, or live-provider fallback.
+
+```toml
+version = 1
+
+[[components]]
+kind = "adaptive"
+enabled = true
+
+[components.config]
+version = 1
+
+[components.config.response_cache]
+namespace = "cpu-workload"
+
+[components.config.response_cache.record_replay]
+mode = "record" # record | verify | replay
+trace_directory = "/bench/trace"
+output_directory = "/bench/out"
+latency_scale = 1.0
+
+[components.config.response_cache.record_replay.key_filters]
+drop = ["/prompt_cache_key", "/extra_headers"]
+redact_lines = ['^Session ID: .*$']
+tool_results = "placeholder"
+```
+
+The trace directory must already exist. Record mode refuses to overwrite
+Relay-owned trace files. After the recording process exits, the launcher removes
+`record.lock` and finalizes the trace before starting a new verification/replay
+process. A trace with a lock, unsupported format, incompatible key policy,
+corrupt records, or an exhausted answer fails closed.
+
+| Setting | Behavior |
+|---|---|
+| `mode` | `record` calls the live provider; `verify` and `replay` serve only recorded answers. |
+| `latency_scale` | Multiplies each original chunk offset and stream-end offset. Zero disables simulated waits. |
+| `start_gate` | Optional `path` and positive `timeout_seconds`; the first request must match before reporting ready. |
+| `key_filters` | JSON-pointer drops, literal block and multiline-regex redaction, and tool-result placeholders. Tool arguments, roles and order remain part of the request key. |
+| `divergence` | Live-tool names, outcome/flag fields, output-size tolerance and optional replay tool-CPU measurements. |
+
+Repeated requests consume their recorded answers in FIFO order. Original Chat
+Completions and Responses stream chunks retain reasoning, usage and provider
+extension fields; buffered replay uses the recorded aggregate. Timing output
+reports delivery lateness separately from the recorded schedule. A stream
+abandoned by its caller is incomplete, even if the Python producer prefetched it.
+Items known to be available before the consumer poll carry `hermes_paced: true`.
+Other items carry `null`: bridge timing cannot establish when socket data arrived.
+Record/replay currently requires Unix. Other platforms report a validation warning
+and install fail-closed intercepts; ordinary response caching remains available.
+
+Only the adaptive response-cache section may be enabled in this mode. Do not
+configure tool caching, cache bypass, header allowlists, a Redis backend, or a
+custom intercept priority. Malformed record/replay fields produce warning
+diagnostics while error-returning intercepts stay active. Validation errors
+outside that section retain their ordinary behavior, so callers must run plugin
+validation before execution and refuse problematic configurations.
+
+Trace files exclude transport headers, but request bodies and model answers can
+still contain sensitive content. Use synthetic or reviewed workloads and scan
+recordings before accepting or distributing them. Network and GPU isolation are
+launcher responsibilities; fail-closed model interception alone does not block
+arbitrary network access by live tools.
+
+### Python Configuration
+
+```python
+from nemo_relay.adaptive import (
+    AdaptiveConfig, ComponentSpec, KeyFiltersConfig,
+    RecordReplayConfig, ResponseCacheConfig,
+)
+
+component = ComponentSpec(AdaptiveConfig(
+    response_cache=ResponseCacheConfig(
+        namespace="cpu-workload",
+        record_replay=RecordReplayConfig(
+            mode="verify",
+            trace_directory="/bench/trace",
+            output_directory="/bench/out",
+            key_filters=KeyFiltersConfig(tool_results="placeholder"),
+        ),
+    ),
+))
+```
+
+The normal managed LLM and tool APIs remain the execution surface; no harness
+code changes are required. Every agent needs its own writable output directory.
