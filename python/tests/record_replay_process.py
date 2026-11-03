@@ -38,7 +38,10 @@ async def main() -> None:
                             trace_directory=str(trace),
                             output_directory=str(out),
                             latency_scale=float(os.environ.get("RR_TEST_SCALE", "0")),
-                            key_filters=KeyFiltersConfig(tool_results="placeholder"),
+                            key_filters=KeyFiltersConfig(
+                                tool_results="placeholder",
+                                drop=["/input/*/id", "/input/*/metadata/turn_id"] if scenario == "wildcard" else [],
+                            ),
                             divergence=DivergenceConfig(
                                 tool_names=["terminal"], tool_fields=["/exit_code"], flag_fields=[]
                             ),
@@ -107,6 +110,23 @@ async def main() -> None:
                 "store": False,
             },
         )
+        if scenario == "wildcard":
+            request = LLMRequest(
+                {},
+                {
+                    "model": "m",
+                    "input": [
+                        {
+                            "id": "msg_" + mode + str(i),
+                            "role": "user",
+                            "content": "stable",
+                            "metadata": {"turn_id": mode, "content_item_kinds": ["text"]},
+                        }
+                        for i in range(2)
+                    ],
+                    "store": False,
+                },
+            )
         if scenario == "miss":
             request = LLMRequest({}, {"model": "m", "input": [{"role": "user", "content": "changed"}], "store": False})
         collected = []
@@ -145,7 +165,7 @@ async def main() -> None:
         await background
         assert progress and first_delivery is not None
         assert progress[0] + 0.02 < first_delivery, (progress, first_delivery)
-    if scenario in ("complete", "timed", "terminal_drop"):
+    if scenario in ("complete", "timed", "terminal_drop", "wildcard"):
         assert received == frames
         assert tool_calls == 1
     (out / "process.json").write_text(

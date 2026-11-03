@@ -38,7 +38,7 @@ impl KeyBuilder {
                     .expect("validated regex")
             })
             .collect();
-        let policy = json!({"filter_version":1, "key_filters":filters, "redacted_placeholder":REDACTED,
+        let policy = json!({"filter_version":2, "key_filters":filters, "redacted_placeholder":REDACTED,
             "tool_result_placeholder":TOOL_RESULT, "namespace":cache.namespace, "key_strategy":cache.key_strategy,
             "cache_schema_version":crate::response_cache::store::CACHE_SCHEMA_VERSION});
         let policy_hash = fingerprint(&policy).expect("validated key policy");
@@ -61,10 +61,7 @@ impl KeyBuilder {
         let mut filtered = request.content.clone();
         let mut matches = BTreeMap::new();
         for pointer in &self.filters.drop {
-            matches.insert(
-                format!("drop:{pointer}"),
-                u64::from(remove(&mut filtered, pointer)),
-            );
+            matches.insert(format!("drop:{pointer}"), remove(&mut filtered, pointer));
         }
         if let Some(body) = filtered.as_object_mut() {
             body.remove("extra_headers");
@@ -197,26 +194,56 @@ impl KeyBuilder {
     }
 }
 
-fn remove(value: &mut Json, pointer: &str) -> bool {
+fn remove(value: &mut Json, pointer: &str) -> u64 {
     if pointer.is_empty() {
         let present = !value.is_null();
         *value = Json::Null;
-        return present;
+        return u64::from(present);
     }
-    let Some((parent, leaf)) = pointer.rsplit_once('/') else {
-        return false;
+    let Some(path) = pointer.strip_prefix('/') else {
+        return 0;
     };
-    let key = leaf.replace("~1", "/").replace("~0", "~");
-    match value.pointer_mut(parent) {
-        Some(Json::Object(map)) => map.remove(&key).is_some(),
-        Some(Json::Array(items)) => match key.parse::<usize>() {
-            Ok(i) if i < items.len() && key == i.to_string() => {
-                items.remove(i);
-                true
+    let tokens: Vec<_> = path
+        .split('/')
+        .map(|token| token.replace("~1", "/").replace("~0", "~"))
+        .collect();
+    remove_path(value, &tokens)
+}
+
+fn remove_path(value: &mut Json, tokens: &[String]) -> u64 {
+    let Some((key, rest)) = tokens.split_first() else {
+        return 0;
+    };
+    match value {
+        Json::Object(map) => {
+            // An asterisk is a literal object key, just as in RFC 6901.
+            if rest.is_empty() {
+                u64::from(map.remove(key).is_some())
+            } else {
+                map.get_mut(key).map_or(0, |child| remove_path(child, rest))
             }
-            _ => false,
+        }
+        Json::Array(items) if key == "*" => {
+            if rest.is_empty() {
+                let count = items.len() as u64;
+                items.clear();
+                count
+            } else {
+                items.iter_mut().map(|child| remove_path(child, rest)).sum()
+            }
+        }
+        Json::Array(items) => match key.parse::<usize>() {
+            Ok(i) if i < items.len() && *key == i.to_string() => {
+                if rest.is_empty() {
+                    items.remove(i);
+                    1
+                } else {
+                    remove_path(&mut items[i], rest)
+                }
+            }
+            _ => 0,
         },
-        _ => false,
+        _ => 0,
     }
 }
 
@@ -287,6 +314,86 @@ pub fn first_difference(a: &Json, b: &Json) -> Option<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn array_wildcards_preserve_object_keys_escapes_and_index_rules() {
+        let mut value = json!({
+            "input": [{"id":"a"}, {"id":"b"}, {}, null, [{"id":"nested"}]],
+            "*": {"a/b": [{"~id":"x"}, {"~id":"y"}]},
+            "object": {"*": {"id":"literal"}, "other": {"id":"keep"}},
+            "list": [[0,1],[2,3]]
+        });
+        assert_eq!(remove(&mut value, "/input/*/id"), 2);
+        assert_eq!(value["input"][4][0]["id"], "nested");
+        assert_eq!(remove(&mut value, "/*/a~1b/*/~0id"), 2);
+        assert_eq!(remove(&mut value, "/object/*/id"), 1);
+        assert_eq!(value["object"]["other"]["id"], "keep");
+        for path in ["/list/01/0", "/list/+0/0", "/list/-/0", "/list/9/0"] {
+            assert_eq!(remove(&mut value, path), 0);
+        }
+        assert_eq!(remove(&mut value, "/list/*/0"), 2);
+        assert_eq!(value["list"], json!([[1], [3]]));
+        assert_eq!(remove(&mut value, "/list/*/*"), 2);
+        assert_eq!(value["list"], json!([[], []]));
+        assert_eq!(remove(&mut value, "/input/*/missing"), 0);
+        assert_eq!(remove(&mut value, "/input/*"), 5);
+        assert_eq!(value["input"], json!([]));
+    }
+
+    #[test]
+    fn responses_volatile_message_fields_do_not_hide_semantic_changes() {
+        let cache = ResponseCacheConfig::default();
+        let key = KeyBuilder::new(
+            &cache,
+            KeyFiltersConfig {
+                drop: vec![
+                    "/input/*/id".into(),
+                    "/input/*/internal_chat_message_metadata_passthrough/create_time".into(),
+                    "/input/*/internal_chat_message_metadata_passthrough/turn_id".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        let a = LlmRequest {
+            content: json!({"model":"m", "input":[
+                {"id":"msg_1", "role":"user", "content":"stable", "internal_chat_message_metadata_passthrough": {
+                    "create_time":123.5, "turn_id":"t1", "content_item_kinds":["text"]}},
+                {"id":"msg_2", "type":"function_call", "name":"exec_command", "call_id":"call1", "arguments":"{}"}
+            ]}),
+            headers: Default::default(),
+        };
+        let mut b = a.clone();
+        b.content["input"][0]["id"] = json!("msg_new");
+        b.content["input"][1]["id"] = json!("msg_other");
+        b.content["input"][0]["internal_chat_message_metadata_passthrough"]["create_time"] =
+            json!(999.1);
+        b.content["input"][0]["internal_chat_message_metadata_passthrough"]["turn_id"] =
+            json!("t2");
+        let recorded = key.build("responses.create", &a, &cache);
+        let live = key.build("responses.create", &b, &cache);
+        assert_eq!(recorded.hash, live.hash);
+        assert_eq!(live.matches["drop:/input/*/id"], 2);
+        assert_eq!(
+            live.matches["drop:/input/*/internal_chat_message_metadata_passthrough/create_time"],
+            1
+        );
+        assert_eq!(key.policy()["filter_version"], 2);
+        for path in [
+            "/input/0/content",
+            "/input/0/role",
+            "/input/1/call_id",
+            "/input/1/arguments",
+            "/input/0/internal_chat_message_metadata_passthrough/content_item_kinds",
+        ] {
+            let mut changed = b.clone();
+            *changed.content.pointer_mut(path).unwrap() = json!("semantic change");
+            assert_ne!(
+                recorded.hash,
+                key.build("responses.create", &changed, &cache).hash,
+                "{path}"
+            );
+        }
+    }
+
     #[test]
     fn drift_matches_but_tool_arguments_and_prompts_do_not() {
         let cache = ResponseCacheConfig {

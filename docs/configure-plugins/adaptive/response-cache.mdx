@@ -658,6 +658,18 @@ corrupt records, or an exhausted answer fails closed.
 | `key_filters` | JSON-pointer drops, literal block and multiline-regex redaction, and tool-result placeholders. Tool arguments, roles and order remain part of the request key. |
 | `divergence` | Live-tool names, outcome/flag fields, output-size tolerance and optional replay tool-CPU measurements. |
 
+Drop paths use RFC 6901 escaping (`~1` for `/`, `~0` for `~`). A `*`
+segment expands over every element only when its current parent is an array:
+`/input/*/id` removes each input item's `id`, counting each field removed.
+In an object, `*` remains a literal key. Exact array indices must be canonical
+nonnegative integers (no leading zeros or `+` prefix). A final array `*`
+removes all its elements without shifting or skipping matches. Missing paths
+are unchanged. Narrow drops such as
+`/input/*/internal_chat_message_metadata_passthrough/create_time` preserve
+adjacent semantic metadata; tool arguments and `call_id` remain significant
+unless explicitly selected by a drop. This interpretation is bound by key-policy
+`filter_version = 2`; traces recorded with the previous policy fail closed.
+
 Repeated requests consume their recorded answers in FIFO order. Original Chat
 Completions and Responses stream chunks retain reasoning, usage and provider
 extension fields. Buffered replay uses the recorded aggregate: for Responses

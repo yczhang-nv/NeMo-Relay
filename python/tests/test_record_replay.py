@@ -110,3 +110,15 @@ def test_record_and_replay_close_after_terminal_without_eof(tmp_path: Path) -> N
     (trace / "record.lock").unlink()
     invoke("replay", trace, tmp_path / "replay", "terminal_drop")
     assert lines(tmp_path / "replay", "timing")[0]["outcome"] == "complete"
+
+
+def test_array_wildcard_drops_across_native_record_and_replay(tmp_path: Path) -> None:
+    trace = tmp_path / "trace"
+    trace.mkdir()
+    invoke("record", trace, tmp_path / "record", "wildcard")
+    request = json.loads((trace / "requests.jsonl").read_text())
+    assert all("id" not in item and "turn_id" not in item["metadata"] for item in request["filtered_request"]["input"])
+    (trace / "record.lock").unlink()
+    result = invoke("replay", trace, tmp_path / "replay", "wildcard")
+    assert result == {"model_calls": 0, "tool_calls": 1, "received": 3}
+    assert lines(tmp_path / "replay", "timing")[0]["outcome"] == "complete"
