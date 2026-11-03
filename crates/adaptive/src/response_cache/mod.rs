@@ -16,6 +16,8 @@ pub mod config;
 pub(crate) mod intercept;
 pub(crate) mod key;
 pub(crate) mod mark;
+/// Dedicated fail-closed trace recording and replay.
+pub(crate) mod record_replay;
 pub(crate) mod replay;
 /// Public only for the integration-test crate and the CLI doctor's backend
 /// health check; not part of the user-facing API.

@@ -207,7 +207,12 @@ impl AdaptiveRuntime {
             return Err(AdaptiveError::InvalidConfig(joined));
         }
 
-        let backend = match config.state.as_ref() {
+        let backend = match config.state.as_ref().filter(|_| {
+            config
+                .response_cache
+                .as_ref()
+                .is_none_or(|c| c.record_replay.is_none())
+        }) {
             Some(state) => Some(build_backend(&state.backend).await?),
             None => None,
         };
@@ -458,6 +463,22 @@ impl AdaptiveRuntime {
     }
 
     fn pending_features(&self, agent_id: &str) -> Vec<Box<dyn AdaptiveFeature>> {
+        if let Some(config) = self
+            .config
+            .response_cache
+            .clone()
+            .filter(|c| c.record_replay.is_some())
+        {
+            let mut feature = ResponseCacheFeature::new(config, self.runtime_id);
+            feature.record_replay_diagnostics = self
+                .report
+                .diagnostics
+                .iter()
+                .filter(|d| d.code.starts_with("response_cache.record_replay_"))
+                .map(|d| d.code.clone())
+                .collect();
+            return vec![Box::new(feature)];
+        }
         let mut pending: Vec<Box<dyn AdaptiveFeature>> = vec![];
         if let Some(config) = self.config.telemetry.clone()
             && self.backend.is_some()
@@ -858,6 +879,7 @@ struct ResponseCacheFeature {
     tool_name: String,
     priority: i32,
     config: ResponseCacheConfig,
+    record_replay_diagnostics: Vec<String>,
 }
 
 impl ResponseCacheFeature {
@@ -868,6 +890,7 @@ impl ResponseCacheFeature {
             tool_name: format!("adaptive_{runtime_id}_response_cache_tool_execution"),
             priority: config.priority,
             config,
+            record_replay_diagnostics: vec![],
         }
     }
 }
@@ -878,6 +901,18 @@ impl AdaptiveFeature for ResponseCacheFeature {
         ctx: &'a mut RegistrationContext<'_>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            if self.config.record_replay.is_some() {
+                let (llm, stream, tool, cleanup) = crate::response_cache::record_replay::activate(
+                    self.config.clone(),
+                    self.record_replay_diagnostics.clone(),
+                );
+                let priority = crate::response_cache::record_replay::PRIORITY;
+                ctx.register_llm_execution_intercept(&self.name, priority, llm)?;
+                ctx.register_llm_stream_execution_intercept(&self.stream_name, priority, stream)?;
+                ctx.register_tool_execution_intercept(&self.tool_name, priority, tool)?;
+                ctx.registrations.add_registration(cleanup);
+                return Ok(());
+            }
             let store = match build_store(&self.config).await {
                 Ok(store) => store,
                 Err(AdaptiveError::Storage(error)) => {

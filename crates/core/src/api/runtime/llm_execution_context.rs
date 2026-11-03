@@ -123,6 +123,7 @@ impl LlmResponseCodec for RevocableResponseCodec {
 pub struct LlmExecutionContext {
     request_codec: LlmRequestContext,
     response_codec: Option<LlmResponseContext>,
+    consumer_clock: Option<super::stream_consumer_clock::StreamConsumerClock>,
 }
 
 impl LlmExecutionContext {
@@ -135,6 +136,7 @@ impl LlmExecutionContext {
         Self {
             request_codec,
             response_codec,
+            consumer_clock: super::stream_consumer_clock::StreamConsumerClock::current(),
         }
     }
 
@@ -192,7 +194,11 @@ impl LlmExecutionContext {
                 });
 
         (
-            Self::new(request_codec, response_codec),
+            Self {
+                request_codec,
+                response_codec,
+                consumer_clock: self.consumer_clock.clone(),
+            },
             LlmExecutionCodecLeaseGuard {
                 gate,
                 request_codec: leased_request_codec,
@@ -205,6 +211,12 @@ impl LlmExecutionContext {
     #[must_use]
     pub fn request_codec(&self) -> &LlmRequestContext {
         &self.request_codec
+    }
+
+    /// Internal optional caller-poll clock for lossless stream recorders.
+    #[doc(hidden)]
+    pub fn consumer_clock(&self) -> Option<super::stream_consumer_clock::StreamConsumerClock> {
+        self.consumer_clock.clone()
     }
 
     /// Return the completed-response codec identity and revocable capability.
