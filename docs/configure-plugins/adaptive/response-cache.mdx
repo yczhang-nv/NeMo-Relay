@@ -727,3 +727,12 @@ needs no record/replay-specific code, but it must consume each replayed stream
 through its terminal item and accept chunks delivered as JSON objects, because
 replay opens no provider stream. Every agent needs its own writable output
 directory.
+
+Record call rows include `completed_mono_ns`, the host monotonic timestamp at
+the recording collector's completion boundary. Read it together with `outcome`: a
+failed or abandoned call remains failed or abandoned. Replay timing rows include
+`lateness_samples_us`, the sorted per-chunk and end-deadline observations used
+for that row's existing quantiles (one end observation for a buffered call).
+Consumers can combine these samples to compute a whole-agent percentile instead
+of averaging per-call percentiles. Monotonic timestamps are local diagnostics,
+not portable wall-clock times or cache-key inputs.

@@ -193,6 +193,7 @@ fn call_line(operation: &str, request: &LlmRequest, run: &Run, answer: RecordedA
     let usage = response.get("usage").cloned().filter(Json::is_object);
     json!({"seq":run.seq,"key_hash":run.key.hash,"repeat_index":run.repeat,"keyless_reason":run.key.reason,
         "operation":operation,"stream":stream,"model":request.content.get("model"),"outcome":outcome,
+        "completed_mono_ns":mono_ns(),
         "error":if matches!(outcome,"provider_error"|"stream_error"){json!({"class":outcome,"message":"upstream call did not complete"})}else{Json::Null},
         "gate_wait_ms":run.gate_wait_ms,"ttft_us":first,"total_us":total,"chunks":chunks,"end_hermes_paced":end_paced,
         "response":response,"usage_chunk":usage.is_some(),"usage":usage,"cpu":{"start":run.cpu_start,"end":cpu_end}})
@@ -498,6 +499,7 @@ fn finalize_replay(state: &Arc<Mutex<Replaying>>, receipt: Option<StreamConsumer
         "scheduled_first_us":state.entry.ttft_us.map(|v|scaled_us(v,scale)),"actual_first_us":actual.first().filter(|_|released>0),
         "scheduled_end_us":scaled_us(state.entry.total_us,scale),"actual_end_us":end,
         "lateness_us":{"p50":quantile(0.5),"p99":quantile(0.99),"max":lateness.last().copied().unwrap_or(0)},
+        "lateness_samples_us":lateness,
         "chunks":delivered,"gate_wait_ms":run.gate_wait_ms,"cpu":{"start":run.cpu_start,"end":cpu::snapshot()}}));
 }
 
@@ -535,7 +537,7 @@ impl Drop for BufferedTiming {
         session.output("timing",json!({"seq":run.seq,"key_hash":run.key.hash,"repeat_index":run.repeat,"stream":false,
             "outcome":if self.complete{"complete"}else{"consumer_dropped"},"t0_mono_ns":mono_ns().saturating_sub(run.t0.elapsed().as_nanos() as u64),
             "scheduled_first_us":null,"actual_first_us":null,"scheduled_end_us":scheduled,"actual_end_us":actual,
-            "lateness_us":{"p50":late,"p99":late,"max":late},
+            "lateness_us":{"p50":late,"p99":late,"max":late},"lateness_samples_us":[late],
             "chunks":0,"gate_wait_ms":run.gate_wait_ms,"cpu":{"start":run.cpu_start,"end":cpu::snapshot()}}));
     }
 }

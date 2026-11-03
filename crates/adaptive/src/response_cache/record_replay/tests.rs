@@ -124,6 +124,7 @@ async fn streaming(
         .unwrap()
 }
 async fn recorded_buffered() -> Dirs {
+    let before = super::session::mono_ns();
     let dirs = Dirs::new();
     let session = Session::activate(dirs.cache("record"), false);
     unary(
@@ -134,6 +135,9 @@ async fn recorded_buffered() -> Dirs {
     .await
     .unwrap();
     session.close();
+    let calls = json_lines(&dirs.trace.join("calls.jsonl")).unwrap();
+    let completed = calls[0]["completed_mono_ns"].as_u64().unwrap();
+    assert!((before..=super::session::mono_ns()).contains(&completed));
     dirs.copy_finalized()
 }
 
@@ -254,6 +258,7 @@ async fn malformed_section_and_missing_trace_are_fail_closed() {
 
 #[tokio::test]
 async fn raw_chunks_and_aggregate_preserve_reasoning() {
+    let before = super::session::mono_ns();
     let dirs = Dirs::new();
     let session = Session::activate(dirs.cache("record"), false);
     let mut stream = streaming(
@@ -273,6 +278,8 @@ async fn raw_chunks_and_aggregate_preserve_reasoning() {
         .pop()
         .unwrap();
     assert_eq!(line["outcome"], "ok");
+    let completed = line["completed_mono_ns"].as_u64().unwrap();
+    assert!((before..=super::session::mono_ns()).contains(&completed));
     assert_eq!(
         line["response"]["choices"][0]["message"]["reasoning_content"],
         "why?"
@@ -375,7 +382,23 @@ async fn replay_deadlines_keep_end_gap_and_do_not_drift() {
             Duration::from_micros((50000.0 * scale) as u64)
         );
         assert_eq!(count.load(Ordering::SeqCst), 0);
-        assert_eq!(replay.output("timing")[0]["outcome"], "complete");
+        let rows = replay.output("timing");
+        let timing = &rows[0];
+        assert_eq!(timing["outcome"], "complete");
+        let samples: Vec<u64> = timing["lateness_samples_us"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap())
+            .collect();
+        // Three delivered chunks and the end-of-stream deadline are retained.
+        assert_eq!(samples.len(), 4);
+        assert!(samples.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(timing["lateness_us"]["p99"], samples[2]);
+        assert_eq!(timing["lateness_us"]["max"], samples[3]);
+        if scale == 1.0 {
+            assert_eq!(samples, vec![0, 0, 15_000, 25_000]);
+        }
     }
 }
 
@@ -1145,6 +1168,10 @@ async fn cancelled_buffered_replay_writes_a_dropped_timing_line() {
     let timing = dirs.output("timing");
     assert_eq!(timing.len(), 1);
     assert_eq!(timing[0]["outcome"], "consumer_dropped");
+    assert_eq!(
+        timing[0]["lateness_samples_us"],
+        json!([timing[0]["lateness_us"]["max"]])
+    );
     assert!(!lock(&session.state.data).busy);
 }
 
