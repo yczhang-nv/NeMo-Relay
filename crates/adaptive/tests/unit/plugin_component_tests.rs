@@ -449,3 +449,54 @@ async fn adaptive_plugin_registers_runtime_and_rolls_back_registration() {
     assert_eq!(registrations.len(), 1);
     rollback_registrations(&mut registrations);
 }
+
+#[test]
+fn record_replay_component_policy_never_escalates_to_errors() {
+    let config = json!({
+        "version": 1,
+        "policy": {"unknown_field": "error", "unsupported_value": "error"},
+        "response_cache": {
+            "namespace": "rr",
+            "namspace_typo": true,
+            "record_replay": {"mode": "replay", "trace_directory": "/t", "output_directory": "/o"}
+        }
+    });
+
+    let diagnostics = validate_adaptive_plugin_config(config.as_object().unwrap());
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.level == DiagnosticLevel::Warning),
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "response_cache.record_replay_forbidden_policy")
+    );
+}
+
+#[test]
+fn record_replay_uses_default_cache_priority_but_rejects_explicit_priority() {
+    let raw = json!({"response_cache":{
+        "namespace":"rr", "record_replay":{
+            "mode":"replay", "trace_directory":"/t", "output_directory":"/o"
+        }
+    }});
+    let config: AdaptiveConfig = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(config.response_cache.as_ref().unwrap().priority, 150);
+    let component: PluginComponentSpec = ComponentSpec::new(config).into();
+    assert!(component.config["response_cache"].get("priority").is_none());
+    assert!(validate_adaptive_plugin_config(&component.config).is_empty());
+    for priority in [50, 150, 151] {
+        let mut explicit = raw.clone();
+        explicit["response_cache"]["priority"] = json!(priority);
+        let diagnostics = validate_adaptive_plugin_config(explicit.as_object().unwrap());
+        assert!(
+            diagnostics.iter().any(|d| d.code
+                == "response_cache.record_replay_forbidden_cache_setting"
+                && d.field.as_deref() == Some("response_cache.priority")),
+            "{diagnostics:?}"
+        );
+    }
+}

@@ -24,6 +24,11 @@ set `cache_nondeterministic = true` to opt sampled requests into caching.
 Runtime backend errors fail open to a normal live call, while invalid
 configuration is rejected during validation.
 
+The optional `record_replay` mode uses a separate trace store and different
+failure behavior. Verification and replay never invoke the managed model
+provider, including when a request cannot be matched. See
+[Record and Replay](#record-and-replay) below.
+
 `namespace` is required and defines one trusted cache-sharing domain. Do not
 use one namespace across mutually untrusted tenants or upstreams.
 `header_allowlist` does not replace this trust boundary.
@@ -606,3 +611,140 @@ Tool-cache diagnostics use the following error codes.
 | `response_cache.tool_catch_all_override` | A cacheable `*` override applies to every tool. |
 | `response_cache.tool_conflicting_classes` | Overlapping wildcard members in different classes have different `cacheable` values. |
 | `response_cache.tool_conflicting_overrides` | Overlapping wildcard overrides have different `cacheable` declarations. An omitted value inherits policy, so it cannot safely overlap an explicit value. |
+
+## Record and Replay
+
+Use `response_cache.record_replay` to record managed model responses once, then
+serve their original chunks on their recorded schedule while every tool runs
+live. This mode is separate from ordinary caching: it has no TTL, cache bypass,
+tool-result substitution, or live-provider fallback.
+
+```toml
+version = 1
+
+[[components]]
+kind = "adaptive"
+enabled = true
+
+[components.config]
+version = 1
+
+[components.config.response_cache]
+namespace = "cpu-workload"
+
+[components.config.response_cache.record_replay]
+mode = "record" # record | verify | replay
+trace_directory = "/bench/trace"
+output_directory = "/bench/out"
+latency_scale = 1.0
+
+[components.config.response_cache.record_replay.key_filters]
+drop = ["/prompt_cache_key", "/extra_headers"]
+redact_lines = ['^Session ID: .*$']
+tool_results = "placeholder"
+```
+
+The trace directory must already exist. Record mode refuses to overwrite
+Relay-owned trace files. After the recording process exits, the launcher removes
+`record.lock` and finalizes the trace before starting a new verification/replay
+process. A trace with a lock, unsupported format, incompatible key policy,
+corrupt records, or an exhausted answer fails closed.
+
+| Setting | Behavior |
+|---|---|
+| `mode` | `record` calls the live provider; `verify` and `replay` serve only recorded answers. |
+| `latency_scale` | Multiplies each original chunk offset and stream-end offset. Zero disables simulated waits. |
+| `start_gate` | Optional `path` and positive `timeout_seconds`; the first request must match before reporting ready. |
+| `key_filters` | JSON-pointer drops, literal block and multiline-regex redaction, and tool-result placeholders. Tool arguments, roles and order remain part of the request key. |
+| `divergence` | Live-tool names, outcome/flag fields, output-size tolerance and optional replay tool-CPU measurements. |
+
+Drop paths use RFC 6901 escaping (`~1` for `/`, `~0` for `~`). A `*`
+segment expands over every element only when its current parent is an array:
+`/input/*/id` removes each input item's `id`, counting each field removed.
+In an object, `*` remains a literal key. Exact array indices must be canonical
+nonnegative integers (no leading zeros or `+` prefix). A final array `*`
+removes all its elements without shifting or skipping matches. Missing paths
+are unchanged. Narrow drops such as
+`/input/*/internal_chat_message_metadata_passthrough/create_time` preserve
+adjacent semantic metadata; tool arguments and `call_id` remain significant
+unless explicitly selected by a drop. This interpretation is bound by key-policy
+`filter_version = 2`; traces recorded with the previous policy fail closed.
+
+Repeated requests consume their recorded answers in FIFO order. Original Chat
+Completions and Responses stream chunks retain reasoning, usage and provider
+extension fields. Buffered replay uses the recorded aggregate: for Responses
+streams, the terminal response with its `output` rebuilt from the
+`response.output_item.done` items. A `response.incomplete` terminal, such as a
+maximum-output-token stop, is a complete answer; `response.failed`, an `error`
+event, or a stream without a terminal response is a stream error.
+
+Timing output reports when the paced stream released each chunk and its end,
+and the lateness against the recorded schedule. A call counts as complete only
+when its caller consumed the entire answer, even if the Python bridge prefetched
+it. A Responses caller may close or drop immediately after receiving a successful
+terminal envelope without polling transport EOF; that call is complete when every
+recorded chunk was delivered. Chat Completions still requires EOF because finish
+reasons can precede other choices or a final usage chunk. A failed terminal or a prefetched but undelivered answer is
+never complete. A call stops being in flight when its stream ends, so a caller
+that holds a finished stream does not block the next call.
+
+Each recorded chunk and stream end carries a `hermes_paced` marker. The name
+comes from the benchmark harness, but the marker applies to any caller of the
+Python bridge. It is `true` when the item was available before the caller asked
+for it, so the recorded offset reflects the caller's pace, and `false` when the
+caller was already waiting. It is `null` when no consumer clock was attached.
+Availability is measured at the bridge, not at socket arrival.
+
+Record/replay currently requires Unix. Other platforms report a validation warning
+and install fail-closed intercepts; ordinary response caching remains available.
+
+Only the adaptive response-cache section may be enabled in this mode. Do not
+configure tool caching, cache bypass, header allowlists, a Redis backend, a
+non-default policy, or a custom intercept priority. Malformed record/replay
+fields and forbidden settings produce warning diagnostics while error-returning
+model intercepts stay active. Tools always run live: in the fail-closed state
+they run unrecorded and uncompared. Validation errors
+outside that section retain their ordinary behavior, so callers must run plugin
+validation before execution and refuse problematic configurations.
+
+Trace files exclude transport headers, but request bodies and model answers can
+still contain sensitive content. Use synthetic or reviewed workloads and scan
+recordings before accepting or distributing them. Network and GPU isolation are
+launcher responsibilities; fail-closed model interception alone does not block
+arbitrary network access by live tools.
+
+### Python Configuration
+
+```python
+from nemo_relay.adaptive import (
+    AdaptiveConfig, ComponentSpec, KeyFiltersConfig,
+    RecordReplayConfig, ResponseCacheConfig,
+)
+
+component = ComponentSpec(AdaptiveConfig(
+    response_cache=ResponseCacheConfig(
+        namespace="cpu-workload",
+        record_replay=RecordReplayConfig(
+            mode="verify",
+            trace_directory="/bench/trace",
+            output_directory="/bench/out",
+            key_filters=KeyFiltersConfig(tool_results="placeholder"),
+        ),
+    ),
+))
+```
+
+The normal managed LLM and tool APIs remain the execution surface. A harness
+needs no record/replay-specific code, but it must consume each replayed stream
+through its terminal item and accept chunks delivered as JSON objects, because
+replay opens no provider stream. Every agent needs its own writable output
+directory.
+
+Record call rows include `completed_mono_ns`, the host monotonic timestamp at
+the recording collector's completion boundary. Read it together with `outcome`: a
+failed or abandoned call remains failed or abandoned. Replay timing rows include
+`lateness_samples_us`, the sorted per-chunk and end-deadline observations used
+for that row's existing quantiles (one end observation for a buffered call).
+Consumers can combine these samples to compute a whole-agent percentile instead
+of averaging per-call percentiles. Monotonic timestamps are local diagnostics,
+not portable wall-clock times or cache-key inputs.

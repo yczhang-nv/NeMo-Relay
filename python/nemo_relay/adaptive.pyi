@@ -8,6 +8,7 @@ This module exposes the canonical adaptive configuration helpers, the
 helpers that summarize ACG observations into structured JSON payloads.
 """
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, TypedDict
@@ -233,6 +234,52 @@ class ToolCacheConfig:
         ...
 
 @dataclass(slots=True)
+class StartGateConfig:
+    """First-model-call gate."""
+
+    path: str | os.PathLike[str]
+    timeout_seconds: int = ...
+
+@dataclass(slots=True)
+class RedactBlock:
+    """Inclusive literal text-block filter."""
+
+    start: str
+    end: str
+
+@dataclass(slots=True)
+class KeyFiltersConfig:
+    """Volatile-field filters and tool-result placeholders."""
+
+    drop: list[str] = ...
+    redact_lines: list[str] = ...
+    redact_blocks: list[RedactBlock] = ...
+    tool_results: Literal["keep", "placeholder"] = ...
+
+@dataclass(slots=True)
+class DivergenceConfig:
+    """Live-tool signature comparison settings."""
+
+    tool_names: list[str] = ...
+    tool_fields: list[str] = ...
+    flag_fields: list[str] = ...
+    output_size_tolerance: float = ...
+    measure_tool_cpu_time: bool = ...
+
+@dataclass(slots=True)
+class RecordReplayConfig:
+    """Dedicated recording and fail-closed verification/replay."""
+
+    mode: Literal["record", "verify", "replay"]
+    trace_directory: str | os.PathLike[str]
+    output_directory: str | os.PathLike[str]
+    latency_scale: float = ...
+    start_gate: StartGateConfig | None = ...
+    key_filters: KeyFiltersConfig | None = ...
+    divergence: DivergenceConfig | None = ...
+    def to_dict(self) -> JsonObject: ...
+
+@dataclass(slots=True)
 class ResponseCacheConfig:
     """Opt-in LLM response and tool-result cache settings.
 
@@ -262,6 +309,7 @@ class ResponseCacheConfig:
     header_allowlist: list[str] = ...
     backend: BackendSpec = ...
     tools: ToolCacheConfig | None = ...
+    record_replay: RecordReplayConfig | None = ...
 
     def to_dict(self) -> JsonObject:
         """Serialize this response-cache config to the canonical JSON object shape."""
